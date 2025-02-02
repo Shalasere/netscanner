@@ -156,7 +156,7 @@ impl Ports {
         self.scrollbar_state = self.scrollbar_state.position(index);
     }
 
-    fn scan_ports(&mut self, index: usize) {
+    /**fn scan_ports(&mut self, index: usize) {
         if index >= self.ip_ports.len() {
             return; // -- index out of bounds
         }
@@ -177,6 +177,29 @@ impl Ports {
             tx.send(Action::PortScanDone(index)).unwrap();
         });
     }
+    */
+    fn scan_ports(&mut self) {
+        for (index, scanned_ip) in self.ip_ports.iter().enumerate() {
+            if scanned_ip.state != PortsScanState::Scanning {
+                let mut ip_ports = self.ip_ports.clone();
+                ip_ports[index].state = PortsScanState::Scanning;
+
+                let tx = self.action_tx.clone().unwrap();
+                let ip: IpAddr = scanned_ip.ip.parse().unwrap();
+                let ports_box = Box::new(COMMON_PORTS.iter());
+
+                let h = tokio::spawn(async move {
+                    let ports = stream::iter(ports_box);
+                    ports
+                        .for_each_concurrent(POOL_SIZE, |port| {
+                            Self::scan(tx.clone(), index, ip, port.to_owned(), 2)
+                        })
+                        .await;
+                    tx.send(Action::PortScanDone(index)).unwrap();
+                });
+            }
+        }
+    }
 
     async fn scan(tx: UnboundedSender<Action>, index: usize, ip: IpAddr, port: u16, timeout: u64) {
         let timeout = Duration::from_secs(2);
@@ -186,10 +209,14 @@ impl Ports {
         }
     }
 
-    fn scan_selected(&mut self) {
+    /**fn scan_selected(&mut self) {
         if let Some(index) = self.list_state.selected() {
             self.scan_ports(index);
         }
+    }
+    */
+    fn scan_selected(&mut self) {
+        self.scan_ports();
     }
 
     fn store_scanned_port(&mut self, index: usize, port: u16) {
