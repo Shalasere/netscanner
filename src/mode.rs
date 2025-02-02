@@ -1,5 +1,5 @@
+use ratatui::style::Color;
 use serde::{Deserialize, Serialize};
-use ratatui::style::Color; 
 
 #[derive(Default, Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Mode {
@@ -7,4 +7,3 @@ pub enum Mode {
     Normal,
     Input,
 }
-

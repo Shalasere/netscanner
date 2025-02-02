@@ -14,7 +14,7 @@ impl StatefulWidget for TrafficScroll {
     type State = ScrollViewState;
 
     fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
-        let c_size = Size::new(area.width-1, (3 * self.traffic_ips.len()) as u16);
+        let c_size = Size::new(area.width - 1, (3 * self.traffic_ips.len()) as u16);
         let mut scrollview = ScrollView::new(c_size);
         let total = count_traffic_total(&self.traffic_ips);
 

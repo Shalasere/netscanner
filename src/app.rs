@@ -13,12 +13,12 @@ use crate::{
         interfaces::Interfaces,
         packetdump::PacketDump,
         ports::{Ports, ScannedIpPorts},
+        sniff::Sniffer,
         tabs::Tabs,
         title::Title,
         wifi_chart::WifiChart,
         wifi_interface::WifiInterface,
         wifi_scan::WifiScan,
-        sniff::Sniffer,
         Component,
     },
     config::Config,
@@ -162,7 +162,8 @@ impl App {
                         // comvert into specific struct
                         let mut scanned_ips: Vec<ScannedIp> = Vec::new();
                         let mut scanned_ports: Vec<ScannedIpPorts> = Vec::new();
-                        let mut arp_packets: Vec<(DateTime<Local>, PacketsInfoTypesEnum)> = Vec::new();
+                        let mut arp_packets: Vec<(DateTime<Local>, PacketsInfoTypesEnum)> =
+                            Vec::new();
                         let mut udp_packets = Vec::new();
                         let mut tcp_packets = Vec::new();
                         let mut icmp_packets = Vec::new();
@@ -171,12 +172,14 @@ impl App {
                         for component in &self.components {
                             if let Some(d) = component.as_any().downcast_ref::<Discovery>() {
                                 scanned_ips = d.get_scanned_ips().to_vec();
-                            } else if let Some(pd) = component.as_any().downcast_ref::<PacketDump>() {
+                            } else if let Some(pd) = component.as_any().downcast_ref::<PacketDump>()
+                            {
                                 arp_packets = pd.clone_array_by_packet_type(PacketTypeEnum::Arp);
                                 udp_packets = pd.clone_array_by_packet_type(PacketTypeEnum::Udp);
                                 tcp_packets = pd.clone_array_by_packet_type(PacketTypeEnum::Tcp);
                                 icmp_packets = pd.clone_array_by_packet_type(PacketTypeEnum::Icmp);
-                                icmp6_packets = pd.clone_array_by_packet_type(PacketTypeEnum::Icmp6);
+                                icmp6_packets =
+                                    pd.clone_array_by_packet_type(PacketTypeEnum::Icmp6);
                             } else if let Some(p) = component.as_any().downcast_ref::<Ports>() {
                                 scanned_ports = p.get_scanned_ports().to_vec();
                             }

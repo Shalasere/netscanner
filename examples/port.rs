@@ -1,11 +1,10 @@
-
 use std::net::TcpListener;
 
 fn main() {
     get_available_port();
-//     if let Some(available_port) = get_available_port() {
-//         println!("port `{}` is available", available_port);
-//     }
+    //     if let Some(available_port) = get_available_port() {
+    //         println!("port `{}` is available", available_port);
+    //     }
 }
 
 // fn get_available_port() -> Option<u16> {

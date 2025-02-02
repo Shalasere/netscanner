@@ -81,7 +81,7 @@ impl Sniffer {
     fn traffic_contains_ip(&self, ip: &IpAddr) -> bool {
         self.traffic_ips
             .iter()
-            .any(|traffic| traffic.ip == ip.clone())
+            .any(|traffic| traffic.ip == *ip)
     }
 
     fn count_traffic_packet(&mut self, source: IpAddr, destination: IpAddr, length: usize) {

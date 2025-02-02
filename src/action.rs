@@ -60,7 +60,7 @@ impl<'de> Deserialize<'de> for Action {
     {
         struct ActionVisitor;
 
-        impl<'de> Visitor<'de> for ActionVisitor {
+        impl Visitor<'_> for ActionVisitor {
             type Value = Action;
 
             fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {

@@ -47,7 +47,7 @@ impl Interfaces {
     fn get_interfaces(&mut self) {
         self.interfaces.clear();
         self.active_interfaces.clear();
-    
+
         let interfaces = datalink::interfaces();
         for intf in &interfaces {
             // -- get active interface with non-local IP
@@ -68,7 +68,7 @@ impl Interfaces {
         // -- sort interfaces
         self.interfaces.sort_by(|a, b| a.name.cmp(&b.name));
     }
-    
+
     fn next_active_interface(&mut self) {
         let mut new_index = self.active_interface_index + 1;
         if new_index >= self.active_interfaces.len() {
@@ -117,7 +117,8 @@ impl Interfaces {
                 w.description.clone()
             } else {
                 w.name.clone()
-            };            let mac = w.mac.unwrap_or(MacAddr::default()).to_string();
+            };
+            let mac = w.mac.unwrap_or(MacAddr::default()).to_string();
             let ipv4: Vec<Line> = w
                 .ips
                 .iter()

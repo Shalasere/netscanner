@@ -204,10 +204,7 @@ impl Ports {
         for ip in &self.ip_ports {
             let mut lines = Vec::new();
 
-            let mut ip_line_vec = vec![
-                "IP:    ".yellow(), 
-                ip.ip.clone().blue(),
-            ];
+            let mut ip_line_vec = vec!["IP:    ".yellow(), ip.ip.clone().blue()];
             if !ip.hostname.is_empty() {
                 ip_line_vec.push(" (".into());
                 ip_line_vec.push(ip.hostname.clone().cyan());

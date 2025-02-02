@@ -84,7 +84,6 @@ impl Export {
         }
     }
 
-
     pub fn write_discovery(&mut self, data: Vec<ScannedIp>, timestamp: &String) -> Result<()> {
         let mut w = Writer::from_path(format!("{}/scanned_ips.{}.csv", self.home_dir, timestamp))?;
 

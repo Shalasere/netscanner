@@ -16,12 +16,12 @@ fn main() {
 
     match env::var_os("SUDO_USER") {
         Some(val) => println!("SUDO_USER: {val:?}"),
-        None => println!("SUDO_USER was not found")
+        None => println!("SUDO_USER was not found"),
     }
 
     match env::var_os("HOME") {
         Some(val) => println!("HOME: {val:?}"),
-        None => println!("HOME was not found")
+        None => println!("HOME was not found"),
     }
 
     if let Err(err) = write_csv() {
@@ -29,4 +29,3 @@ fn main() {
         process::exit(1);
     }
 }
-
