@@ -11,6 +11,8 @@
       "<f>": "Interface",
       "<c>": "Clear",
       "<s>": "Scan",
+      "<a>": "ScanAll",
+      "<p>": "PortInput",
       "<e>": "Export",
       "<up>": "Up",
       "<down>": "Down",

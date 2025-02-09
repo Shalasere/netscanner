@@ -37,6 +37,10 @@ pub enum Action {
     DumpToggle,
     InterfaceSwitch,
     ScanCidr,
+    // Added new variants:
+    ScanSelected,
+    ScanAll,
+    PortInput,
     ActiveInterface(NetworkInterface),
     ArpRecieve(ArpPacketData),
     Scan(Vec<WifiInfo>),
@@ -79,6 +83,9 @@ impl<'de> Deserialize<'de> for Action {
                     "Dump" => Ok(Action::DumpToggle),
                     "Interface" => Ok(Action::InterfaceSwitch),
                     "Scan" => Ok(Action::ScanCidr),
+                    "ScanSelected" => Ok(Action::ScanSelected),
+                    "ScanAll" => Ok(Action::ScanAll),
+                    "PortInput" => Ok(Action::PortInput),
                     "Clear" => Ok(Action::Clear),
                     "Up" => Ok(Action::Up),
                     "Down" => Ok(Action::Down),
@@ -110,14 +117,20 @@ impl<'de> Deserialize<'de> for Action {
                             .split(',')
                             .collect();
                         if parts.len() == 2 {
-                            let width: u16 = parts[0].trim().parse().map_err(E::custom)?;
-                            let height: u16 = parts[1].trim().parse().map_err(E::custom)?;
+                            let width: u16 = parts[0].trim().parse().map_err(de::Error::custom)?;
+                            let height: u16 = parts[1].trim().parse().map_err(de::Error::custom)?;
                             Ok(Action::Resize(width, height))
                         } else {
-                            Err(E::custom(format!("Invalid Resize format: {}", value)))
+                            Err(de::Error::custom(format!(
+                                "Invalid Resize format: {}",
+                                value
+                            )))
                         }
                     }
-                    _ => Err(E::custom(format!("Unknown Action variant: {}", value))),
+                    _ => Err(de::Error::custom(format!(
+                        "Unknown Action variant: {}",
+                        value
+                    ))),
                 }
             }
         }
