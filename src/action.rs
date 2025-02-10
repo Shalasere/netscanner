@@ -1,6 +1,5 @@
 use chrono::{DateTime, Local};
 use pnet::datalink::NetworkInterface;
-use pnet::util::MacAddr;
 use ratatui::text::Line;
 use serde::{
     de::{self, Deserializer, Visitor},
@@ -37,7 +36,6 @@ pub enum Action {
     DumpToggle,
     InterfaceSwitch,
     ScanCidr,
-    // Added new variants:
     ScanSelected,
     ScanAll,
     PortInput,
@@ -50,8 +48,11 @@ pub enum Action {
     CountIp,
     CidrError,
     PacketDump(DateTime<Local>, PacketsInfoTypesEnum, PacketTypeEnum),
-    PortScan(usize, u16),
-    PortScanDone(usize),
+
+    // Changed these two variants to use a stable IP key (String)
+    PortScan(String, u16),
+    PortScanDone(String),
+
     Clear,
     Export,
     ExportData(ExportData),
