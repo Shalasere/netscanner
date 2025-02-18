@@ -117,7 +117,8 @@ impl Ports {
                     line_size += port_str.len();
                     ports_spans.push(port_str.green());
                     if let Some(pd) = port_desc {
-                        let p_type = pd.get_port_service_name(*p, port_desc::TransportProtocol::Tcp);
+                        let p_type =
+                            pd.get_port_service_name(*p, port_desc::TransportProtocol::Tcp);
                         let p_type_str = format!("({})", p_type);
                         ports_spans.push(p_type_str.clone().light_magenta());
                         line_size += p_type_str.len();
@@ -217,7 +218,11 @@ impl Ports {
     fn previous_in_list(&mut self) {
         let index = match self.list_state.selected() {
             Some(idx) if idx == 0 => {
-                if self.ip_ports.is_empty() { 0 } else { self.ip_ports.len() - 1 }
+                if self.ip_ports.is_empty() {
+                    0
+                } else {
+                    self.ip_ports.len() - 1
+                }
             }
             Some(idx) => idx - 1,
             None => 0,
@@ -229,8 +234,16 @@ impl Ports {
     fn next_in_list(&mut self) {
         let index = match self.list_state.selected() {
             Some(idx) => {
-                let max_index = if self.ip_ports.is_empty() { 0 } else { self.ip_ports.len() - 1 };
-                if idx >= max_index { 0 } else { idx + 1 }
+                let max_index = if self.ip_ports.is_empty() {
+                    0
+                } else {
+                    self.ip_ports.len() - 1
+                };
+                if idx >= max_index {
+                    0
+                } else {
+                    idx + 1
+                }
             }
             None => 0,
         };
@@ -263,6 +276,52 @@ impl Ports {
         }
     }
 
+    fn make_port_input(&self, scroll: usize) -> Paragraph {
+        Paragraph::new(self.port_input.value())
+            .style(Style::default().fg(Color::Green))
+            .scroll((0, scroll as u16))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(match self.mode {
+                        Mode::Input => Style::default().fg(Color::Green),
+                        Mode::Normal => Style::default().fg(Color::Rgb(100, 100, 100)),
+                    })
+                    .border_type(DEFAULT_BORDER_STYLE)
+                    .title(
+                        // Change the title to indicate this is for ports
+                        ratatui::widgets::block::Title::from(Line::from(vec![
+                            Span::raw("|"),
+                            Span::styled(
+                                "p",
+                                Style::default().add_modifier(Modifier::BOLD).fg(Color::Red),
+                            ),
+                            Span::styled("orts", Style::default().fg(Color::Yellow)),
+                            Span::raw("/"),
+                            Span::styled(
+                                "ESC",
+                                Style::default().add_modifier(Modifier::BOLD).fg(Color::Red),
+                            ),
+                            Span::raw("|"),
+                        ]))
+                        .alignment(Alignment::Right)
+                        .position(ratatui::widgets::block::Position::Bottom),
+                    )
+                    .title(
+                        ratatui::widgets::block::Title::from(Line::from(vec![
+                            Span::raw("|"),
+                            Span::styled(
+                                "d",
+                                Style::default().add_modifier(Modifier::BOLD).fg(Color::Red),
+                            ),
+                            Span::styled("efaults", Style::default().fg(Color::Yellow)),
+                            Span::raw("|"),
+                        ]))
+                        .alignment(Alignment::Left)
+                        .position(ratatui::widgets::block::Position::Bottom),
+                    ),
+            )
+    }
     // Handle port input key events while in input mode.
     fn handle_port_input(&mut self, key: KeyEvent) -> Option<Action> {
         match key.code {
@@ -532,14 +591,14 @@ impl Component for Ports {
 
         Ok(None)
     }
-   
+
     fn draw(&mut self, f: &mut Frame<'_>, area: Rect) -> Result<()> {
         if self.active_tab == TabsEnum::Ports {
             let layout = get_vertical_layout(area);
             let mut list_rect = layout.bottom;
             list_rect.y += 1;
             list_rect.height = list_rect.height.saturating_sub(1);
-            
+
             // Clone required data for widget construction.
             let ip_ports = self.ip_ports.clone();
             let spinner_index = self.spinner_index;
@@ -561,21 +620,18 @@ impl Component for Ports {
                 }),
                 &mut self.scrollbar_state,
             );
-            
+
             if self.mode == Mode::Input {
+                // Adjust these values as needed so the port input appears in the desired area.
+                let input_size: u16 = 30;
                 let input_rect = Rect::new(
-                    list_rect.x,
-                    list_rect.y.saturating_sub(3),
-                    list_rect.width,
+                    list_rect.x + list_rect.width - input_size - 1, // right side of the list area
+                    list_rect.y + 1,
+                    input_size,
                     3,
                 );
-                let port_input_paragraph = Paragraph::new(self.port_input.value())
-                    .style(Style::default().fg(Color::Green))
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .title("Enter Ports (e.g., 80,443 or 1000-1024)"),
-                    );
+                let scroll = self.port_input.visual_scroll((input_size - 3) as usize);
+                let port_input_paragraph = self.make_port_input(scroll);
                 f.render_widget(port_input_paragraph, input_rect);
                 f.set_cursor_position((
                     input_rect.x + (self.port_input.visual_cursor() as u16) + 1,
