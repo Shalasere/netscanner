@@ -21,14 +21,12 @@ use super::Component;
 use crate::enums::{PortsScanState, TabsEnum};
 use crate::mode::Mode;
 use crate::{
-    action::Action, // Make sure Action uses the updated variants:
-    // For example, PortScan(String, u16) and PortScanDone(String)
+    action::Action, // For example, PortScan(String, u16) and PortScanDone(String)
     config::DEFAULT_BORDER_STYLE,
     layout::get_vertical_layout,
     tui::Frame,
 };
 
-// For testing or limited port scans, define a constant list of common ports.
 pub const DEFAULT_COMMON_PORTS: &[u16] = &[22, 80, 443];
 
 static POOL_SIZE: usize = 64;
@@ -45,13 +43,11 @@ pub struct ScannedIpPorts {
 pub struct Ports {
     active_tab: TabsEnum,
     action_tx: Option<UnboundedSender<Action>>,
-    // We store our scanned IP entries in a vector.
-    // (We now NEVER re-sort this vector so that its indices remain stable.)
     ip_ports: Vec<ScannedIpPorts>,
     list_state: ListState,
     scrollbar_state: ScrollbarState,
     spinner_index: usize,
-    port_input: Input,                 // For user\u2011specified ports.
+    port_input: Input,                 // For user-specified ports.
     specified_ports: Option<Vec<u16>>, // Parsed port numbers.
     mode: Mode,                        // Normal or Input mode.
     port_desc: Option<port_desc::PortDescription>,
@@ -73,7 +69,6 @@ impl Ports {
             list_state: ListState::default().with_selected(Some(0)),
             scrollbar_state: ScrollbarState::new(0),
             spinner_index: 0,
-            // Initialize with a default port list.
             port_input: Input::default().with_value("22,80,443".to_string()),
             specified_ports: None,
             mode: Mode::Normal,
@@ -85,8 +80,6 @@ impl Ports {
         &self.ip_ports
     }
 
-    /// Helper: Build the list widget from given data.
-    /// Note: We now accept an Option reference to a PortDescription.
     fn make_list_from_data(
         ip_ports: Vec<ScannedIpPorts>,
         spinner_index: usize,
@@ -186,13 +179,19 @@ impl Ports {
             )
     }
 
-    /// Process a new IP by updating an existing entry or adding a new one.
     fn process_ip(&mut self, ip: &str) {
         let ipv4: Ipv4Addr = match ip.parse() {
             Ok(addr) => addr,
-            Err(_) => return,
+            Err(e) => {
+                eprintln!("Failed to parse IP {}: {}", ip, e);
+                return;
+            }
         };
-        let hostname = lookup_addr(&ipv4.into()).unwrap_or_default();
+        // Log an error if DNS lookup fails, but don't crash.
+        let hostname = lookup_addr(&ipv4.into()).unwrap_or_else(|e| {
+            eprintln!("DNS lookup failed for {}: {}", ip, e);
+            String::new()
+        });
         if let Some(existing) = self.ip_ports.iter_mut().find(|item| item.ip == ip) {
             existing.hostname = hostname;
         } else {
@@ -251,7 +250,6 @@ impl Ports {
         self.scrollbar_state = self.scrollbar_state.position(index);
     }
 
-    // Parse a port string. Supports ranges (e.g., "1000-1024") or comma\u2011separated lists (e.g., "80,443").
     fn parse_ports(port_str: &str) -> Result<Vec<u16>, String> {
         if port_str.contains('-') {
             let parts: Vec<&str> = port_str.split('-').collect();
@@ -289,7 +287,6 @@ impl Ports {
                     })
                     .border_type(DEFAULT_BORDER_STYLE)
                     .title(
-                        // Change the title to indicate this is for ports
                         ratatui::widgets::block::Title::from(Line::from(vec![
                             Span::raw("|"),
                             Span::styled(
@@ -322,7 +319,7 @@ impl Ports {
                     ),
             )
     }
-    // Handle port input key events while in input mode.
+
     fn handle_port_input(&mut self, key: KeyEvent) -> Option<Action> {
         match key.code {
             KeyCode::Enter => match Self::parse_ports(self.port_input.value()) {
@@ -340,17 +337,29 @@ impl Ports {
         }
     }
 
-    /// Start scanning ports for the IP at the given index.
     fn scan_ports_for_index(&mut self, index: usize) {
         if index >= self.ip_ports.len() {
             return;
         }
-        // Mark the entry as "scanning".
         self.ip_ports[index].state = PortsScanState::Scanning;
-        let tx = self.action_tx.clone().expect("Action TX not registered");
-        // Use the IP string as a stable key.
+        let tx = match self.action_tx.clone() {
+            Some(tx) => tx,
+            None => {
+                eprintln!("Action TX not registered");
+                return;
+            }
+        };
         let ip_key = self.ip_ports[index].ip.clone();
-        let ip_addr: IpAddr = self.ip_ports[index].ip.parse().unwrap();
+        let ip_addr: IpAddr = match self.ip_ports[index].ip.parse() {
+            Ok(addr) => addr,
+            Err(e) => {
+                eprintln!(
+                    "Failed to parse IP address {}: {}",
+                    self.ip_ports[index].ip, e
+                );
+                return;
+            }
+        };
         let ports_vec: Vec<u16> = if let Some(ref ports) = self.specified_ports {
             ports.clone()
         } else {
@@ -364,25 +373,36 @@ impl Ports {
                     Self::scan(tx.clone(), ip_key.clone(), ip_addr, port, 2)
                 })
                 .await;
-            // Notify that scanning is done for this IP.
-            tx.send(Action::PortScanDone(ip_key)).unwrap();
+            if let Err(e) = tx.send(Action::PortScanDone(ip_key.clone())) {
+                eprintln!("Failed to send PortScanDone for {}: {}", ip_key, e);
+            }
         });
     }
 
-    /// Scan only the currently selected IP.
     fn scan_selected(&mut self) {
         if let Some(index) = self.list_state.selected() {
             self.scan_ports_for_index(index);
         }
     }
 
-    /// Scan ports for all known IPs.
     fn scan_ports(&mut self) {
         for i in 0..self.ip_ports.len() {
             if self.ip_ports[i].state != PortsScanState::Scanning {
-                let tx = self.action_tx.clone().expect("Action TX not registered");
+                let tx = match self.action_tx.clone() {
+                    Some(tx) => tx,
+                    None => {
+                        eprintln!("Action TX not registered");
+                        return;
+                    }
+                };
                 let ip_key = self.ip_ports[i].ip.clone();
-                let ip_addr: IpAddr = self.ip_ports[i].ip.parse().unwrap();
+                let ip_addr: IpAddr = match self.ip_ports[i].ip.parse() {
+                    Ok(addr) => addr,
+                    Err(e) => {
+                        eprintln!("Failed to parse IP address {}: {}", self.ip_ports[i].ip, e);
+                        continue;
+                    }
+                };
                 let ports_vec: Vec<u16> = if let Some(ref ports) = self.specified_ports {
                     ports.clone()
                 } else {
@@ -396,13 +416,14 @@ impl Ports {
                             Self::scan(tx.clone(), ip_key.clone(), ip_addr, port, 2)
                         })
                         .await;
-                    tx.send(Action::PortScanDone(ip_key)).unwrap();
+                    if let Err(e) = tx.send(Action::PortScanDone(ip_key.clone())) {
+                        eprintln!("Failed to send PortScanDone for {}: {}", ip_key, e);
+                    }
                 });
             }
         }
     }
 
-    /// Asynchronous scanning function.
     async fn scan(
         tx: UnboundedSender<Action>,
         ip_key: String,
@@ -412,15 +433,22 @@ impl Ports {
     ) {
         let timeout_duration = Duration::from_secs(timeout);
         let socket_addr = SocketAddr::new(ip, port);
-        if let Ok(Ok(_stream)) =
-            tokio::time::timeout(timeout_duration, TcpStream::connect(&socket_addr)).await
-        {
-            // Notify that a port is open on the given IP.
-            tx.send(Action::PortScan(ip_key, port)).unwrap();
+        match tokio::time::timeout(timeout_duration, TcpStream::connect(&socket_addr)).await {
+            Ok(Ok(_stream)) => {
+                // Clone ip_key so that the original remains available for logging.
+                if let Err(e) = tx.send(Action::PortScan(ip_key.clone(), port)) {
+                    eprintln!("Failed to send PortScan for {} port {}: {}", ip_key, port, e);
+                }
+            },
+            Ok(Err(e)) => {
+                eprintln!("Connection error on {}: {}", socket_addr, e);
+            },
+            Err(e) => {
+                eprintln!("Timeout connecting to {}: {}", socket_addr, e);
+            }
         }
     }
-
-    /// Record a scanned open port for a given IP.
+    
     fn store_scanned_port(&mut self, ip_key: &str, port: u16) {
         if let Some(entry) = self.ip_ports.iter_mut().find(|item| item.ip == ip_key) {
             if !entry.ports.contains(&port) {
@@ -429,7 +457,6 @@ impl Ports {
         }
     }
 
-    /// Build the list widget for the UI.
     fn make_list(&self, rect: Rect) -> List {
         let mut items = Vec::new();
         for ip in &self.ip_ports {
@@ -524,7 +551,6 @@ impl Ports {
             )
     }
 
-    /// Build a scrollbar widget.
     pub fn make_scrollbar<'a>() -> Scrollbar<'a> {
         Scrollbar::default()
             .orientation(ScrollbarOrientation::VerticalRight)
@@ -554,7 +580,6 @@ impl Component for Ports {
     }
 
     fn update(&mut self, action: Action) -> Result<Option<Action>> {
-        // Use a match on a reference to avoid moving fields inside action.
         match &action {
             Action::Tick => {
                 self.spinner_index = (self.spinner_index + 1) % SPINNER_SYMBOLS.len();
@@ -599,13 +624,10 @@ impl Component for Ports {
             list_rect.y += 1;
             list_rect.height = list_rect.height.saturating_sub(1);
 
-            // Clone required data for widget construction.
             let ip_ports = self.ip_ports.clone();
             let spinner_index = self.spinner_index;
-            // Instead of cloning port_desc (which cannot be cloned), borrow it:
             let port_desc = self.port_desc.as_ref();
             let list = Self::make_list_from_data(ip_ports, spinner_index, port_desc, list_rect);
-            // Now we can safely borrow `self.list_state` mutably.
             f.render_stateful_widget(list, list_rect, &mut self.list_state);
 
             let scrollbar = Self::make_scrollbar();
@@ -622,10 +644,9 @@ impl Component for Ports {
             );
 
             if self.mode == Mode::Input {
-                // Adjust these values as needed so the port input appears in the desired area.
                 let input_size: u16 = 30;
                 let input_rect = Rect::new(
-                    list_rect.x + list_rect.width - input_size - 1, // right side of the list area
+                    list_rect.x + list_rect.width - input_size - 1,
                     list_rect.y + 1,
                     input_size,
                     3,
