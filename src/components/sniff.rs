@@ -6,14 +6,15 @@ use ipnetwork::IpNetwork;
 use pnet::{
     datalink::NetworkInterface,
     packet::{
+        MutablePacket, Packet,
         arp::{ArpHardwareTypes, ArpOperations, ArpPacket, MutableArpPacket},
         ethernet::{EtherTypes, MutableEthernetPacket},
-        MutablePacket, Packet,
     },
 };
 use ratatui::style::Stylize;
 
 use ratatui::{prelude::*, widgets::*};
+use std::collections::HashSet;
 use std::net::IpAddr;
 use tokio::sync::mpsc::{self, UnboundedSender};
 use tui_scrollview::{ScrollView, ScrollViewState};
@@ -23,7 +24,7 @@ use crate::{
     action::Action,
     config::DEFAULT_BORDER_STYLE,
     enums::{PacketTypeEnum, PacketsInfoTypesEnum, TabsEnum},
-    layout::{get_vertical_layout, HORIZONTAL_CONSTRAINTS},
+    layout::{HORIZONTAL_CONSTRAINTS, get_vertical_layout},
     tui::Frame,
     utils::bytes_convert,
     widgets::scroll_traffic::TrafficScroll,
@@ -47,6 +48,7 @@ pub struct Sniffer {
     udp_sum: f64,
     tcp_sum: f64,
     active_inft_ips: Vec<IpNetwork>,
+    traffic_dirty: bool,
 }
 
 impl Default for Sniffer {
@@ -67,6 +69,7 @@ impl Sniffer {
             udp_sum: 0.0,
             tcp_sum: 0.0,
             active_inft_ips: Vec::new(),
+            traffic_dirty: false,
         }
     }
 
@@ -78,44 +81,46 @@ impl Sniffer {
         self.scrollview_state.scroll_up();
     }
 
-    fn traffic_contains_ip(&self, ip: &IpAddr) -> bool {
-        self.traffic_ips.iter().any(|traffic| traffic.ip == *ip)
+    fn count_traffic_packet(&mut self, source: IpAddr, destination: IpAddr, length: usize) {
+        let length = length as f64;
+        Self::update_traffic_entry(&mut self.traffic_ips, destination, length, 0.0);
+        Self::update_traffic_entry(&mut self.traffic_ips, source, 0.0, length);
+        self.traffic_dirty = true;
     }
 
-    fn count_traffic_packet(&mut self, source: IpAddr, destination: IpAddr, length: usize) {
-        // -- destination
-        if self.traffic_contains_ip(&destination) {
-            if let Some(ip_entry) = self.traffic_ips.iter_mut().find(|ie| ie.ip == destination) {
-                ip_entry.download += length as f64;
-            }
-        } else {
-            self.traffic_ips.push(IPTraffic {
-                ip: destination,
-                download: length as f64,
-                upload: 0.0,
-                hostname: lookup_addr(&destination).unwrap_or(String::from("unknown")),
-            });
+    fn update_traffic_entry(
+        traffic_ips: &mut Vec<IPTraffic>,
+        ip: IpAddr,
+        download_inc: f64,
+        upload_inc: f64,
+    ) {
+        if let Some(entry) = traffic_ips.iter_mut().find(|entry| entry.ip == ip) {
+            entry.download += download_inc;
+            entry.upload += upload_inc;
+            return;
         }
 
-        // -- source
-        if self.traffic_contains_ip(&source) {
-            if let Some(ip_entry) = self.traffic_ips.iter_mut().find(|ie| ie.ip == source) {
-                ip_entry.upload += length as f64;
-            }
-        } else {
-            self.traffic_ips.push(IPTraffic {
-                ip: source,
-                download: 0.0,
-                upload: length as f64,
-                hostname: lookup_addr(&source).unwrap_or(String::from("unknown")),
-            });
+        traffic_ips.push(IPTraffic {
+            ip,
+            download: download_inc,
+            upload: upload_inc,
+            hostname: lookup_addr(&ip).unwrap_or_else(|_| String::from("unknown")),
+        });
+    }
+
+    fn ensure_sorted_traffic(&mut self) {
+        if !self.traffic_dirty {
+            return;
         }
 
         self.traffic_ips.sort_by(|a, b| {
             let a_sum = a.download + a.upload;
             let b_sum = b.download + b.upload;
-            b_sum.partial_cmp(&a_sum).unwrap()
+            b_sum
+                .partial_cmp(&a_sum)
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
+        self.traffic_dirty = false;
     }
 
     fn process_packet(&mut self, packet: PacketsInfoTypesEnum) {
@@ -132,7 +137,7 @@ impl Sniffer {
         }
     }
 
-    fn make_charts(&self) -> BarChart {
+    fn make_charts(&self) -> BarChart<'_> {
         BarChart::default()
             .direction(Direction::Vertical)
             .bar_width(12)
@@ -153,8 +158,8 @@ impl Sniffer {
             )
     }
 
-    fn make_ips_block(&self) -> Block {
-        let ips_block = Block::default()
+    fn make_ips_block(&self) -> Block<'_> {
+        Block::default()
             .title(
                 ratatui::widgets::block::Title::from(Line::from(vec![
                     Span::styled("|", Style::default().fg(Color::Yellow)),
@@ -181,12 +186,11 @@ impl Sniffer {
             )
             .borders(Borders::ALL)
             .border_style(Color::Rgb(100, 100, 100))
-            .border_type(BorderType::Rounded);
-        ips_block
+            .border_type(BorderType::Rounded)
     }
 
-    fn make_sum_block(&self) -> Block {
-        let ips_block = Block::default()
+    fn make_sum_block(&self) -> Block<'_> {
+        Block::default()
             .title(
                 ratatui::widgets::block::Title::from(Span::styled(
                     "|Summary|",
@@ -197,11 +201,10 @@ impl Sniffer {
             )
             .borders(Borders::ALL)
             .border_style(Color::Rgb(100, 100, 100))
-            .border_type(BorderType::Rounded);
-        ips_block
+            .border_type(BorderType::Rounded)
     }
 
-    fn make_charts_block(&self) -> Block {
+    fn make_charts_block(&self) -> Block<'_> {
         Block::default()
             .title(
                 ratatui::widgets::block::Title::from(Span::styled(
@@ -246,24 +249,27 @@ impl Sniffer {
                 },
             );
 
-            let a_intfs = &self.active_inft_ips;
-            let tu = self
+            let active_interface_ips: HashSet<IpAddr> =
+                self.active_inft_ips.iter().map(IpNetwork::ip).collect();
+            let mut top_uploader: Option<&IPTraffic> = None;
+            let mut top_downloader: Option<&IPTraffic> = None;
+
+            for traffic in self
                 .traffic_ips
                 .iter()
-                .filter(|item| {
-                    let t_ip = item.ip.to_string();
-                    for i_ip in a_intfs {
-                        if i_ip.ip().to_string() == t_ip {
-                            return false;
-                        }
-                    }
-                    true
-                })
-                .max_by_key(|t| t.upload as u64);
+                .filter(|item| !active_interface_ips.contains(&item.ip))
+            {
+                if top_uploader.is_none_or(|current| traffic.upload > current.upload) {
+                    top_uploader = Some(traffic);
+                }
+                if top_downloader.is_none_or(|current| traffic.download > current.download) {
+                    top_downloader = Some(traffic);
+                }
+            }
 
             let mut tu_ip = String::from("");
             let mut tu_name = String::from("");
-            if let Some(tu) = tu {
+            if let Some(tu) = top_uploader {
                 tu_ip = tu.ip.to_string();
                 tu_name = format!(" ({})", tu.hostname);
             }
@@ -282,23 +288,9 @@ impl Sniffer {
                 },
             );
 
-            let td = self
-                .traffic_ips
-                .iter()
-                .filter(|item| {
-                    let t_ip = item.ip.to_string();
-                    for i_ip in a_intfs {
-                        if i_ip.ip().to_string() == t_ip {
-                            return false;
-                        }
-                    }
-                    true
-                })
-                .max_by_key(|t| t.download as u64);
-
             let mut td_ip = String::from("");
             let mut td_name = String::from("");
-            if let Some(td) = td {
+            if let Some(td) = top_downloader {
                 td_ip = td.ip.to_string();
                 td_name = format!(" ({})", td.hostname);
             }
@@ -368,6 +360,7 @@ impl Component for Sniffer {
 
     fn draw(&mut self, f: &mut Frame<'_>, area: Rect) -> Result<()> {
         if self.active_tab == TabsEnum::Traffic {
+            self.ensure_sorted_traffic();
             let layout = get_vertical_layout(area);
 
             // -- IPs block
@@ -386,7 +379,7 @@ impl Component for Sniffer {
                 height: ips_layout[0].height - 2,
             };
             let ips_scroll = TrafficScroll {
-                traffic_ips: self.traffic_ips.clone(),
+                traffic_ips: &self.traffic_ips,
             };
             f.render_stateful_widget(ips_scroll, ips_rect, &mut self.scrollview_state);
 

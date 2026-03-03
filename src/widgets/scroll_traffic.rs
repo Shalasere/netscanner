@@ -6,17 +6,17 @@ use ratatui::{layout::Size, prelude::*, widgets::*};
 use tui_scrollview::{ScrollView, ScrollViewState};
 
 #[derive(Debug)]
-pub struct TrafficScroll {
-    pub traffic_ips: Vec<IPTraffic>,
+pub struct TrafficScroll<'a> {
+    pub traffic_ips: &'a [IPTraffic],
 }
 
-impl StatefulWidget for TrafficScroll {
+impl StatefulWidget for TrafficScroll<'_> {
     type State = ScrollViewState;
 
     fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
         let c_size = Size::new(area.width - 1, (3 * self.traffic_ips.len()) as u16);
         let mut scrollview = ScrollView::new(c_size);
-        let total = count_traffic_total(&self.traffic_ips);
+        let total = count_traffic_total(self.traffic_ips);
 
         for (index, item) in self.traffic_ips.iter().enumerate() {
             // -- title
@@ -32,7 +32,7 @@ impl StatefulWidget for TrafficScroll {
                 .title_style(Style::default().fg(Color::Blue))
                 .title(Line::from(vec![
                     format!("{}", item.ip).blue(),
-                    format!(" ({})", item.hostname.clone()).magenta(),
+                    format!(" ({})", item.hostname).magenta(),
                 ]));
             scrollview.render_widget(b, b_rect);
 

@@ -7,16 +7,16 @@ use ipnetwork::Ipv4Network;
 use pnet::datalink::{Channel, ChannelType, NetworkInterface};
 use pnet::packet::icmpv6::Icmpv6Types;
 use pnet::packet::{
+    MutablePacket, Packet,
     arp::{ArpHardwareTypes, ArpOperations, ArpPacket, MutableArpPacket},
     ethernet::{EtherTypes, EthernetPacket, MutableEthernetPacket},
-    icmp::{echo_reply, echo_request, IcmpPacket, IcmpTypes},
+    icmp::{IcmpPacket, IcmpTypes, echo_reply, echo_request},
     icmpv6::Icmpv6Packet,
     ip::{IpNextHeaderProtocol, IpNextHeaderProtocols},
     ipv4::Ipv4Packet,
     ipv6::Ipv6Packet,
     tcp::TcpPacket,
     udp::UdpPacket,
-    MutablePacket, Packet,
 };
 use pnet::util::MacAddr;
 
@@ -27,8 +27,8 @@ use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr},
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     },
     thread::{self, JoinHandle},
     time::Duration,
@@ -37,8 +37,8 @@ use tokio::{
     sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
     task,
 };
-use tui_input::backend::crossterm::EventHandler;
 use tui_input::Input;
+use tui_input::backend::crossterm::EventHandler;
 
 use super::{Component, Frame};
 use crate::{
@@ -127,7 +127,7 @@ impl PacketDump {
         source: IpAddr,
         destination: IpAddr,
         packet: &[u8],
-        tx: UnboundedSender<Action>,
+        tx: &UnboundedSender<Action>,
     ) {
         let udp = UdpPacket::new(packet);
         if let Some(udp) = udp {
@@ -163,13 +163,15 @@ impl PacketDump {
         source: IpAddr,
         destination: IpAddr,
         packet: &[u8],
-        tx: UnboundedSender<Action>,
+        tx: &UnboundedSender<Action>,
     ) {
         let icmp_packet = IcmpPacket::new(packet);
         if let Some(icmp_packet) = icmp_packet {
             match icmp_packet.get_icmp_type() {
                 IcmpTypes::EchoReply => {
-                    let echo_reply_packet = echo_reply::EchoReplyPacket::new(packet).unwrap();
+                    let Some(echo_reply_packet) = echo_reply::EchoReplyPacket::new(packet) else {
+                        return;
+                    };
 
                     let raw_str = format!(
                         "[{}]: ICMP echo reply {} -> {} (seq={:?}, id={:?})",
@@ -196,7 +198,10 @@ impl PacketDump {
                     .unwrap();
                 }
                 IcmpTypes::EchoRequest => {
-                    let echo_request_packet = echo_request::EchoRequestPacket::new(packet).unwrap();
+                    let Some(echo_request_packet) = echo_request::EchoRequestPacket::new(packet)
+                    else {
+                        return;
+                    };
 
                     let raw_str = format!(
                         "[{}]: ICMP echo request {} -> {} (seq={:?}, id={:?})",
@@ -232,7 +237,7 @@ impl PacketDump {
         source: IpAddr,
         destination: IpAddr,
         packet: &[u8],
-        tx: UnboundedSender<Action>,
+        tx: &UnboundedSender<Action>,
     ) {
         let icmpv6_packet = Icmpv6Packet::new(packet);
         if let Some(icmpv6_packet) = icmpv6_packet {
@@ -264,7 +269,7 @@ impl PacketDump {
         source: IpAddr,
         destination: IpAddr,
         packet: &[u8],
-        tx: UnboundedSender<Action>,
+        tx: &UnboundedSender<Action>,
     ) {
         let tcp = TcpPacket::new(packet);
         if let Some(tcp) = tcp {
@@ -301,7 +306,7 @@ impl PacketDump {
         destination: IpAddr,
         protocol: IpNextHeaderProtocol,
         packet: &[u8],
-        tx: UnboundedSender<Action>,
+        tx: &UnboundedSender<Action>,
     ) {
         match protocol {
             IpNextHeaderProtocols::Udp => {
@@ -323,7 +328,7 @@ impl PacketDump {
     fn handle_ipv4_packet(
         interface_name: &str,
         ethernet: &EthernetPacket,
-        tx: UnboundedSender<Action>,
+        tx: &UnboundedSender<Action>,
     ) {
         let header = Ipv4Packet::new(ethernet.payload());
         if let Some(header) = header {
@@ -341,7 +346,7 @@ impl PacketDump {
     fn handle_ipv6_packet(
         interface_name: &str,
         ethernet: &EthernetPacket,
-        tx: UnboundedSender<Action>,
+        tx: &UnboundedSender<Action>,
     ) {
         let header = Ipv6Packet::new(ethernet.payload());
         if let Some(header) = header {
@@ -361,7 +366,7 @@ impl PacketDump {
     fn handle_arp_packet(
         interface_name: &str,
         ethernet: &EthernetPacket,
-        tx: UnboundedSender<Action>,
+        tx: &UnboundedSender<Action>,
     ) {
         let header = ArpPacket::new(ethernet.payload());
         if let Some(header) = header {
@@ -403,7 +408,7 @@ impl PacketDump {
     fn handle_ethernet_frame(
         interface: &NetworkInterface,
         ethernet: &EthernetPacket,
-        tx: UnboundedSender<Action>,
+        tx: &UnboundedSender<Action>,
     ) {
         let interface_name = &interface.name[..];
         match ethernet.get_ethertype() {
@@ -444,13 +449,13 @@ impl PacketDump {
             }
         };
 
+        let mut buf = [0u8; 1600];
+        let mut fake_ethernet_frame = MutableEthernetPacket::new(&mut buf[..]).unwrap();
+
         loop {
             if stop.load(Ordering::Relaxed) {
                 break;
             }
-
-            let mut buf: [u8; 1600] = [0u8; 1600];
-            let mut fake_ethernet_frame = MutableEthernetPacket::new(&mut buf[..]).unwrap();
 
             match receiver.next() {
                 Ok(packet) => {
@@ -469,9 +474,11 @@ impl PacketDump {
                             payload_offset = 0;
                         }
                         if packet.len() > payload_offset {
-                            let version = Ipv4Packet::new(&packet[payload_offset..])
-                                .unwrap()
-                                .get_version();
+                            let Some(version_packet) = Ipv4Packet::new(&packet[payload_offset..])
+                            else {
+                                continue;
+                            };
+                            let version = version_packet.get_version();
                             if version == 4 {
                                 fake_ethernet_frame.set_destination(MacAddr(0, 0, 0, 0, 0, 0));
                                 fake_ethernet_frame.set_source(MacAddr(0, 0, 0, 0, 0, 0));
@@ -480,7 +487,7 @@ impl PacketDump {
                                 Self::handle_ethernet_frame(
                                     &interface,
                                     &fake_ethernet_frame.to_immutable(),
-                                    tx.clone(),
+                                    &tx,
                                 );
                                 continue;
                             } else if version == 6 {
@@ -491,17 +498,15 @@ impl PacketDump {
                                 Self::handle_ethernet_frame(
                                     &interface,
                                     &fake_ethernet_frame.to_immutable(),
-                                    tx.clone(),
+                                    &tx,
                                 );
                                 continue;
                             }
                         }
                     }
-                    Self::handle_ethernet_frame(
-                        &interface,
-                        &EthernetPacket::new(packet).unwrap(),
-                        tx.clone(),
-                    );
+                    if let Some(eth) = EthernetPacket::new(packet) {
+                        Self::handle_ethernet_frame(&interface, &eth, &tx);
+                    }
                 }
                 // Err(e) => println!("packetdump: unable to receive packet: {}", e),
                 Err(e) => {}
@@ -573,11 +578,7 @@ impl PacketDump {
                 let logs = self.get_array_by_packet_type(self.packet_type);
                 let logs_len = logs.len();
                 if index == 0 {
-                    if logs_len > 0 {
-                        logs.len() - 1
-                    } else {
-                        0
-                    }
+                    if logs_len > 0 { logs.len() - 1 } else { 0 }
                 } else {
                     index - 1
                 }
@@ -927,7 +928,7 @@ impl PacketDump {
         }
         dump_spans.push(Span::styled("|", Style::default().fg(Color::Yellow)));
 
-        let table = Table::new(rows, [Constraint::Min(10), Constraint::Percentage(100)])
+        Table::new(rows, [Constraint::Min(10), Constraint::Percentage(100)])
             .header(header)
             .block(
                 Block::new()
@@ -986,21 +987,19 @@ impl PacketDump {
                 String::from(char::from_u32(0x25b6).unwrap_or('>')),
                 Style::default().fg(Color::Red),
             ))
-            .column_spacing(1);
-        table
+            .column_spacing(1)
     }
 
     pub fn make_scrollbar<'a>() -> Scrollbar<'a> {
-        let scrollbar = Scrollbar::default()
+        Scrollbar::default()
             .orientation(ScrollbarOrientation::VerticalRight)
             .style(Style::default().fg(Color::Rgb(100, 100, 100)))
             .begin_symbol(None)
-            .end_symbol(None);
-        scrollbar
+            .end_symbol(None)
     }
 
-    fn make_input(&self, scroll: usize) -> Paragraph {
-        let input = Paragraph::new(self.input.value())
+    fn make_input(&self, scroll: usize) -> Paragraph<'_> {
+        Paragraph::new(self.input.value())
             .style(Style::default().fg(Color::Green))
             .scroll((0, scroll as u16))
             .block(
@@ -1042,8 +1041,7 @@ impl PacketDump {
                         .alignment(Alignment::Left)
                         .position(ratatui::widgets::block::Position::Bottom),
                     ),
-            );
-        input
+            )
     }
 
     fn set_filter_str(&mut self, value: String) {
@@ -1087,15 +1085,29 @@ impl Component for PacketDump {
 
     fn update(&mut self, action: Action) -> Result<Option<Action>> {
         // -- change thread loop if interface is changed
-        if self.changed_interface {
-            if let Some(ref lt) = self.loop_thread {
-                if lt.is_finished() {
-                    self.loop_thread = None;
-                    self.dump_stop.store(false, Ordering::SeqCst);
-                    self.start_loop();
-                    self.changed_interface = false;
-                }
+        if self.changed_interface
+            && let Some(ref lt) = self.loop_thread
+            && lt.is_finished()
+        {
+            self.loop_thread = None;
+            self.dump_stop.store(false, Ordering::SeqCst);
+            self.start_loop();
+            self.changed_interface = false;
+        }
+
+        if !self.dump_paused.load(Ordering::Relaxed)
+            && let Action::PacketDump(time, packet, packet_type) = &action
+        {
+            let event = packet.clone();
+            match packet_type {
+                PacketTypeEnum::Tcp => self.tcp_packets.push((*time, event.clone())),
+                PacketTypeEnum::Arp => self.arp_packets.push((*time, event.clone())),
+                PacketTypeEnum::Udp => self.udp_packets.push((*time, event.clone())),
+                PacketTypeEnum::Icmp => self.icmp_packets.push((*time, event.clone())),
+                PacketTypeEnum::Icmp6 => self.icmp6_packets.push((*time, event.clone())),
+                _ => {}
             }
+            self.all_packets.push((*time, event));
         }
 
         // -- tab change
@@ -1161,21 +1173,6 @@ impl Component for PacketDump {
             if let Action::Clear = action {
                 self.input.reset();
                 self.filter_str = String::from("");
-            }
-        }
-
-        // -- packet recieved
-        if !self.dump_paused.load(Ordering::Relaxed) {
-            if let Action::PacketDump(time, packet, packet_type) = action {
-                match packet_type {
-                    PacketTypeEnum::Tcp => self.tcp_packets.push((time, packet.clone())),
-                    PacketTypeEnum::Arp => self.arp_packets.push((time, packet.clone())),
-                    PacketTypeEnum::Udp => self.udp_packets.push((time, packet.clone())),
-                    PacketTypeEnum::Icmp => self.icmp_packets.push((time, packet.clone())),
-                    PacketTypeEnum::Icmp6 => self.icmp6_packets.push((time, packet.clone())),
-                    _ => {}
-                }
-                self.all_packets.push((time, packet.clone()));
             }
         }
 

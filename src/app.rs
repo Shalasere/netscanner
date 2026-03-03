@@ -8,6 +8,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use crate::{
     action::Action,
     components::{
+        Component,
         discovery::{self, Discovery, ScannedIp},
         export::Export,
         interfaces::Interfaces,
@@ -19,7 +20,6 @@ use crate::{
         wifi_chart::WifiChart,
         wifi_interface::WifiInterface,
         wifi_scan::WifiScan,
-        Component,
     },
     config::Config,
     enums::{ExportData, PacketTypeEnum, PacketsInfoTypesEnum},
@@ -42,6 +42,16 @@ pub struct App {
 }
 
 impl App {
+    fn should_dispatch_action(action: &Action, component: &dyn Component) -> bool {
+        match action {
+            // Packet dump actions are high-frequency; only these components consume them.
+            Action::PacketDump(_, _, _) => {
+                component.as_any().is::<PacketDump>() || component.as_any().is::<Sniffer>()
+            }
+            _ => true,
+        }
+    }
+
     pub fn new(tick_rate: f64, frame_rate: f64) -> Result<Self> {
         let title = Title::new();
         let interfaces = Interfaces::default();
@@ -194,7 +204,7 @@ impl App {
                                 icmp_packets,
                                 icmp6_packets,
                             }))
-                            .unwrap();
+                            .ok();
                     }
 
                     Action::Tick => {
@@ -209,9 +219,8 @@ impl App {
                             for component in self.components.iter_mut() {
                                 let r = component.draw(f, f.area());
                                 if let Err(e) = r {
-                                    action_tx
-                                        .send(Action::Error(format!("Failed to draw: {:?}", e)))
-                                        .unwrap();
+                                    let _ = action_tx
+                                        .send(Action::Error(format!("Failed to draw: {:?}", e)));
                                 }
                             }
                         })?;
@@ -221,19 +230,21 @@ impl App {
                             for component in self.components.iter_mut() {
                                 let r = component.draw(f, f.area());
                                 if let Err(e) = r {
-                                    action_tx
-                                        .send(Action::Error(format!("Failed to draw: {:?}", e)))
-                                        .unwrap();
+                                    let _ = action_tx
+                                        .send(Action::Error(format!("Failed to draw: {:?}", e)));
                                 }
                             }
                         })?;
                     }
                     _ => {}
                 }
-                for component in self.components.iter_mut() {
-                    if let Some(action) = component.update(action.clone())? {
-                        action_tx.send(action)?
-                    };
+                for component in &mut self.components {
+                    if !Self::should_dispatch_action(&action, component.as_ref()) {
+                        continue;
+                    }
+                    if let Some(next_action) = component.update(action.clone())? {
+                        action_tx.send(next_action)?
+                    }
                 }
             }
             if self.should_suspend {

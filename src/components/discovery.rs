@@ -2,13 +2,14 @@ use cidr::Ipv4Cidr;
 use color_eyre::eyre::Result;
 use color_eyre::owo_colors::OwoColorize;
 use dns_lookup::{lookup_addr, lookup_host};
-use futures::future::join_all;
+use futures::StreamExt;
+use futures::stream;
 
 use pnet::datalink::{Channel, NetworkInterface};
 use pnet::packet::{
+    MutablePacket, Packet,
     arp::{ArpHardwareTypes, ArpOperations, ArpPacket, MutableArpPacket},
     ethernet::{EtherTypes, MutableEthernetPacket},
-    MutablePacket, Packet,
 };
 use pnet::util::MacAddr;
 use tokio::sync::Semaphore;
@@ -20,7 +21,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::string;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use surge_ping::{Client, Config, IcmpPacket, PingIdentifier, PingSequence, ICMP};
+use surge_ping::{Client, Config, ICMP, IcmpPacket, PingIdentifier, PingSequence};
 use tokio::{
     sync::mpsc::{self, UnboundedSender},
     task::{self, JoinHandle},
@@ -41,8 +42,8 @@ use crossterm::event::Event;
 use crossterm::event::{KeyCode, KeyEvent};
 use mac_oui::Oui;
 use rand::random;
-use tui_input::backend::crossterm::EventHandler;
 use tui_input::Input;
+use tui_input::backend::crossterm::EventHandler;
 
 static POOL_SIZE: usize = 32;
 static INPUT_SIZE: usize = 30;
@@ -128,64 +129,69 @@ impl Discovery {
     }
 
     fn send_arp(&mut self, target_ip: Ipv4Addr) {
-        if let Some(active_interface) = &self.active_interface {
-            if let Some(active_interface_mac) = active_interface.mac {
-                let ipv4 = active_interface.ips.iter().find(|f| f.is_ipv4()).unwrap();
-                let source_ip: Ipv4Addr = ipv4.ip().to_string().parse().unwrap();
+        if let Some(active_interface) = &self.active_interface
+            && let Some(active_interface_mac) = active_interface.mac
+        {
+            let Some(ipv4) = active_interface.ips.iter().find(|f| f.is_ipv4()) else {
+                return;
+            };
+            let Ok(source_ip): Result<Ipv4Addr, _> = ipv4.ip().to_string().parse() else {
+                return;
+            };
 
-                let (mut sender, _) =
-                    match pnet::datalink::channel(active_interface, Default::default()) {
-                        Ok(Channel::Ethernet(tx, rx)) => (tx, rx),
-                        Ok(_) => {
-                            if let Some(tx_action) = &self.action_tx {
-                                tx_action
-                                    .clone()
-                                    .send(Action::Error(
-                                        "Unknown or unsupported channel type".into(),
-                                    ))
-                                    .unwrap();
-                            }
-                            return;
+            let (mut sender, _) =
+                match pnet::datalink::channel(active_interface, Default::default()) {
+                    Ok(Channel::Ethernet(tx, rx)) => (tx, rx),
+                    Ok(_) => {
+                        if let Some(tx_action) = &self.action_tx {
+                            tx_action
+                                .clone()
+                                .send(Action::Error("Unknown or unsupported channel type".into()))
+                                .unwrap();
                         }
-                        Err(e) => {
-                            if let Some(tx_action) = &self.action_tx {
-                                tx_action
-                                    .clone()
-                                    .send(Action::Error(format!(
-                                        "Unable to create datalink channel: {e}"
-                                    )))
-                                    .unwrap();
-                            }
-                            return;
+                        return;
+                    }
+                    Err(e) => {
+                        if let Some(tx_action) = &self.action_tx {
+                            tx_action
+                                .clone()
+                                .send(Action::Error(format!(
+                                    "Unable to create datalink channel: {e}"
+                                )))
+                                .unwrap();
                         }
-                    };
+                        return;
+                    }
+                };
 
-                let mut ethernet_buffer = [0u8; 42];
-                let mut ethernet_packet = MutableEthernetPacket::new(&mut ethernet_buffer).unwrap();
+            let mut ethernet_buffer = [0u8; 42];
+            let Some(mut ethernet_packet) = MutableEthernetPacket::new(&mut ethernet_buffer) else {
+                return;
+            };
 
-                ethernet_packet.set_destination(MacAddr::broadcast());
-                ethernet_packet.set_source(active_interface_mac);
-                ethernet_packet.set_ethertype(EtherTypes::Arp);
+            ethernet_packet.set_destination(MacAddr::broadcast());
+            ethernet_packet.set_source(active_interface_mac);
+            ethernet_packet.set_ethertype(EtherTypes::Arp);
 
-                let mut arp_buffer = [0u8; 28];
-                let mut arp_packet = MutableArpPacket::new(&mut arp_buffer).unwrap();
+            let mut arp_buffer = [0u8; 28];
+            let Some(mut arp_packet) = MutableArpPacket::new(&mut arp_buffer) else {
+                return;
+            };
 
-                arp_packet.set_hardware_type(ArpHardwareTypes::Ethernet);
-                arp_packet.set_protocol_type(EtherTypes::Ipv4);
-                arp_packet.set_hw_addr_len(6);
-                arp_packet.set_proto_addr_len(4);
-                arp_packet.set_operation(ArpOperations::Request);
-                arp_packet.set_sender_hw_addr(active_interface_mac);
-                arp_packet.set_sender_proto_addr(source_ip);
-                arp_packet.set_target_hw_addr(MacAddr::zero());
-                arp_packet.set_target_proto_addr(target_ip);
+            arp_packet.set_hardware_type(ArpHardwareTypes::Ethernet);
+            arp_packet.set_protocol_type(EtherTypes::Ipv4);
+            arp_packet.set_hw_addr_len(6);
+            arp_packet.set_proto_addr_len(4);
+            arp_packet.set_operation(ArpOperations::Request);
+            arp_packet.set_sender_hw_addr(active_interface_mac);
+            arp_packet.set_sender_proto_addr(source_ip);
+            arp_packet.set_target_hw_addr(MacAddr::zero());
+            arp_packet.set_target_proto_addr(target_ip);
 
-                ethernet_packet.set_payload(arp_packet.packet_mut());
+            ethernet_packet.set_payload(arp_packet.packet_mut());
 
-                sender
-                    .send_to(ethernet_packet.packet(), None)
-                    .unwrap()
-                    .unwrap();
+            if let Some(result) = sender.send_to(ethernet_packet.packet(), None) {
+                let _ = result;
             }
         }
     }
@@ -248,42 +254,38 @@ impl Discovery {
 
             self.task = tokio::spawn(async move {
                 let ips = get_ips4_from_cidr(cidr);
-                let tasks: Vec<_> = ips
-                    .iter()
-                    .map(|&ip| {
+                stream::iter(ips)
+                    .for_each_concurrent(POOL_SIZE, |ip| {
                         let s = semaphore.clone();
                         let tx = tx.clone();
-                        let c = || async move {
-                            let _permit = s.acquire().await.unwrap();
-                            let client =
-                                Client::new(&Config::default()).expect("Cannot create client");
+                        async move {
+                            let Ok(_permit) = s.acquire().await else {
+                                let _ = tx.send(Action::CountIp);
+                                return;
+                            };
+
+                            let client = match Client::new(&Config::default()) {
+                                Ok(client) => client,
+                                Err(_) => {
+                                    let _ = tx.send(Action::CountIp);
+                                    return;
+                                }
+                            };
                             let payload = [0; 56];
                             let mut pinger = client
                                 .pinger(IpAddr::V4(ip), PingIdentifier(random()))
                                 .await;
                             pinger.timeout(Duration::from_secs(2));
 
-                            match pinger.ping(PingSequence(2), &payload).await {
-                                Ok((IcmpPacket::V4(packet), dur)) => {
-                                    tx.send(Action::PingIp(packet.get_real_dest().to_string()))
-                                        .unwrap_or_default();
-                                    tx.send(Action::CountIp).unwrap_or_default();
-                                }
-                                Ok(_) => {
-                                    tx.send(Action::CountIp).unwrap_or_default();
-                                }
-                                Err(_) => {
-                                    tx.send(Action::CountIp).unwrap_or_default();
-                                }
+                            if let Ok((IcmpPacket::V4(packet), _)) =
+                                pinger.ping(PingSequence(2), &payload).await
+                            {
+                                let _ = tx.send(Action::PingIp(packet.get_real_dest().to_string()));
                             }
-                        };
-                        tokio::spawn(c())
+                            let _ = tx.send(Action::CountIp);
+                        }
                     })
-                    .collect();
-                for t in tasks {
-                    let _ = t.await;
-                }
-                // let _ = join_all(tasks).await;
+                    .await;
             });
         };
     }
@@ -307,30 +309,32 @@ impl Discovery {
     }
 
     fn process_ip(&mut self, ip: &str) {
-        let tx = self.action_tx.as_ref().unwrap();
         let ipv4: Ipv4Addr = ip.parse().unwrap();
         // self.send_arp(ipv4);
+        let hip = IpAddr::V4(ipv4);
+        let host = lookup_addr(&hip).unwrap_or_default();
 
         if let Some(n) = self.scanned_ips.iter_mut().find(|item| item.ip == ip) {
-            let hip: IpAddr = ip.parse().unwrap();
-            let host = lookup_addr(&hip).unwrap_or_default();
             n.hostname = host;
             n.ip = ip.to_string();
         } else {
-            let hip: IpAddr = ip.parse().unwrap();
-            let host = lookup_addr(&hip).unwrap_or_default();
-            self.scanned_ips.push(ScannedIp {
+            let new_ip = ScannedIp {
                 ip: ip.to_string(),
                 mac: String::new(),
                 hostname: host,
                 vendor: String::new(),
-            });
-
-            self.scanned_ips.sort_by(|a, b| {
-                let a_ip: Ipv4Addr = a.ip.parse::<Ipv4Addr>().unwrap();
-                let b_ip: Ipv4Addr = b.ip.parse::<Ipv4Addr>().unwrap();
-                a_ip.partial_cmp(&b_ip).unwrap()
-            });
+            };
+            let insert_idx = self
+                .scanned_ips
+                .binary_search_by(|existing| {
+                    existing
+                        .ip
+                        .parse::<Ipv4Addr>()
+                        .unwrap_or(Ipv4Addr::UNSPECIFIED)
+                        .cmp(&ipv4)
+                })
+                .unwrap_or_else(|idx| idx);
+            self.scanned_ips.insert(insert_idx, new_ip);
         }
 
         self.set_scrollbar_height();
@@ -381,11 +385,7 @@ impl Discovery {
                 if !self.scanned_ips.is_empty() {
                     s_ip_len = self.scanned_ips.len() - 1;
                 }
-                if index >= s_ip_len {
-                    0
-                } else {
-                    index + 1
-                }
+                if index >= s_ip_len { 0 } else { index + 1 }
             }
             None => 0,
         };
@@ -398,7 +398,7 @@ impl Discovery {
         cidr: Option<Ipv4Cidr>,
         ip_num: i32,
         is_scanning: bool,
-    ) -> Table {
+    ) -> Table<'_> {
         let header = Row::new(vec!["ip", "mac", "hostname", "vendor"])
             .style(Style::default().fg(Color::Yellow))
             .top_margin(1)
@@ -438,7 +438,7 @@ impl Discovery {
             scan_title.push(")".yellow());
         }
 
-        let table = Table::new(
+        Table::new(
             rows,
             [
                 Constraint::Length(16),
@@ -488,21 +488,19 @@ impl Discovery {
                 .border_type(DEFAULT_BORDER_STYLE),
         )
         .highlight_symbol(String::from(char::from_u32(0x25b6).unwrap_or('>')).red())
-        .column_spacing(1);
-        table
+        .column_spacing(1)
     }
 
     pub fn make_scrollbar<'a>() -> Scrollbar<'a> {
-        let scrollbar = Scrollbar::default()
+        Scrollbar::default()
             .orientation(ScrollbarOrientation::VerticalRight)
             .style(Style::default().fg(Color::Rgb(100, 100, 100)))
             .begin_symbol(None)
-            .end_symbol(None);
-        scrollbar
+            .end_symbol(None)
     }
 
-    fn make_input(&self, scroll: usize) -> Paragraph {
-        let input = Paragraph::new(self.input.value())
+    fn make_input(&self, scroll: usize) -> Paragraph<'_> {
+        Paragraph::new(self.input.value())
             .style(Style::default().fg(Color::Green))
             .scroll((0, scroll as u16))
             .block(
@@ -544,23 +542,21 @@ impl Discovery {
                         .alignment(Alignment::Left)
                         .position(ratatui::widgets::block::Position::Bottom),
                     ),
-            );
-        input
+            )
     }
 
-    fn make_error(&mut self) -> Paragraph {
-        let error = Paragraph::new("CIDR parse error")
+    fn make_error(&mut self) -> Paragraph<'_> {
+        Paragraph::new("CIDR parse error")
             .style(Style::default().fg(Color::Red))
             .block(
                 Block::default()
                     .borders(Borders::ALL)
                     .border_type(BorderType::Double)
                     .border_style(Style::default().fg(Color::Red)),
-            );
-        error
+            )
     }
 
-    fn make_spinner(&self) -> Span {
+    fn make_spinner(&self) -> Span<'_> {
         let spinner = SPINNER_SYMBOLS[self.spinner_index];
         Span::styled(
             format!("{spinner}scanning.."),
@@ -615,12 +611,12 @@ impl Component for Discovery {
     }
 
     fn update(&mut self, action: Action) -> Result<Option<Action>> {
-        if self.is_scanning {
-            if let Action::Tick = action {
-                let mut s_index = self.spinner_index + 1;
-                s_index %= SPINNER_SYMBOLS.len() - 1;
-                self.spinner_index = s_index;
-            }
+        if self.is_scanning
+            && let Action::Tick = action
+        {
+            let mut s_index = self.spinner_index + 1;
+            s_index %= SPINNER_SYMBOLS.len() - 1;
+            self.spinner_index = s_index;
         }
 
         // -- custom actions
@@ -649,13 +645,12 @@ impl Component for Discovery {
             self.process_mac(arp_data.clone());
         }
         // -- Scan CIDR
-        if let Action::ScanCidr = action {
-            if self.active_interface.is_some()
-                && !self.is_scanning
-                && self.active_tab == TabsEnum::Discovery
-            {
-                self.scan();
-            }
+        if let Action::ScanCidr = action
+            && self.active_interface.is_some()
+            && !self.is_scanning
+            && self.active_tab == TabsEnum::Discovery
+        {
+            self.scan();
         }
         // -- active interface
         if let Action::ActiveInterface(ref interface) = action {
