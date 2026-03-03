@@ -44,7 +44,12 @@ impl Interfaces {
         }
     }
 
-    fn get_interfaces(&mut self) {
+    fn get_interfaces(&mut self) -> bool {
+        let prev_active_name = self
+            .active_interfaces
+            .get(self.active_interface_index)
+            .map(|i| i.name.clone());
+
         self.interfaces.clear();
         self.active_interfaces.clear();
 
@@ -54,11 +59,13 @@ impl Interfaces {
             if (cfg!(windows) || intf.is_up()) && !intf.ips.is_empty() {
                 // Windows doesn't have the is_up() method
                 for ip in &intf.ips {
-                    if let IpAddr::V4(ipv4) = ip.ip() {
-                        if ipv4.is_private() && !ipv4.is_loopback() && !ipv4.is_unspecified() {
-                            self.active_interfaces.push(intf.clone());
-                            break;
-                        }
+                    if let IpAddr::V4(ipv4) = ip.ip()
+                        && ipv4.is_private()
+                        && !ipv4.is_loopback()
+                        && !ipv4.is_unspecified()
+                    {
+                        self.active_interfaces.push(intf.clone());
+                        break;
                     }
                 }
             }
@@ -67,6 +74,29 @@ impl Interfaces {
         }
         // -- sort interfaces
         self.interfaces.sort_by(|a, b| a.name.cmp(&b.name));
+
+        // Keep the same active interface across refreshes when possible.
+        if self.active_interfaces.is_empty() {
+            self.active_interface_index = 0;
+        } else if let Some(prev_name) = prev_active_name.as_ref() {
+            if let Some(idx) = self
+                .active_interfaces
+                .iter()
+                .position(|i| i.name == *prev_name)
+            {
+                self.active_interface_index = idx;
+            } else {
+                self.active_interface_index = 0;
+            }
+        } else {
+            self.active_interface_index = 0;
+        }
+
+        let new_active_name = self
+            .active_interfaces
+            .get(self.active_interface_index)
+            .map(|i| i.name.clone());
+        prev_active_name != new_active_name
     }
 
     fn next_active_interface(&mut self) {
@@ -94,12 +124,14 @@ impl Interfaces {
         let elapsed = (now - self.last_update_time).as_secs_f64();
         if elapsed > 5.0 {
             self.last_update_time = now;
-            self.get_interfaces();
+            if self.get_interfaces() {
+                self.send_active_interface();
+            }
         }
         Ok(())
     }
 
-    fn make_table(&mut self) -> Table {
+    fn make_table(&mut self) -> Table<'_> {
         let mut active_interface: Option<&NetworkInterface> = None;
         if !self.active_interfaces.is_empty() {
             active_interface = Some(&self.active_interfaces[self.active_interface_index]);
@@ -162,7 +194,7 @@ impl Interfaces {
             );
         }
 
-        let table = Table::new(
+        Table::new(
             rows,
             [
                 Constraint::Length(1),
@@ -187,8 +219,7 @@ impl Interfaces {
                 .border_type(DEFAULT_BORDER_STYLE)
                 .padding(Padding::new(0, 0, 1, 0)),
         )
-        .column_spacing(1);
-        table
+        .column_spacing(1)
     }
 }
 

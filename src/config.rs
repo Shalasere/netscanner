@@ -9,8 +9,8 @@ use ratatui::{
     widgets::{BorderType, Borders},
 };
 use serde::{
-    de::{self, Deserializer, MapAccess, Visitor},
     Deserialize, Serialize,
+    de::{self, Deserializer, MapAccess, Visitor},
 };
 use serde_json::Value as JsonValue;
 
@@ -219,7 +219,7 @@ pub fn key_event_to_string(key_event: &KeyEvent) -> String {
             char = format!("f({c})");
             &char
         }
-        KeyCode::Char(c) if c == ' ' => "space",
+        KeyCode::Char(' ') => "space",
         KeyCode::Char(c) => {
             char = c.to_string();
             &char
@@ -267,8 +267,7 @@ pub fn parse_key_sequence(raw: &str) -> Result<Vec<KeyEvent>, String> {
     }
     let raw = if !raw.contains("><") {
         let raw = raw.strip_prefix('<').unwrap_or(raw);
-        let raw = raw.strip_prefix('>').unwrap_or(raw);
-        raw
+        raw.strip_prefix('>').unwrap_or(raw)
     } else {
         raw
     };
@@ -460,7 +459,7 @@ mod tests {
     #[test]
     fn test_parse_color_rgb() {
         let color = parse_color("rgb123");
-        let expected = 16 + 1 * 36 + 2 * 6 + 3;
+        let expected = 16 + 36 + 2 * 6 + 3;
         assert_eq!(color, Some(Color::Indexed(expected)));
     }
 

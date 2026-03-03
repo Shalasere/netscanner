@@ -1,5 +1,8 @@
 use chrono::{DateTime, Local, Timelike};
-use config::Source;
+use std::cmp::Ordering;
+use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::time::Instant;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_wifiscanner::Wifi;
@@ -27,12 +30,8 @@ pub struct WifiInfo {
 }
 
 impl WifiInfo {
-    fn copy_values(&mut self, net: WifiInfo) {
-        self.time = net.time;
-        self.ssid = net.ssid;
-        self.channel = net.channel;
-        self.signal = net.signal;
-        self.mac = net.mac;
+    fn key(&self) -> String {
+        WifiScan::network_key(&self.ssid, &self.mac)
     }
 }
 
@@ -42,6 +41,8 @@ pub struct WifiScan {
     pub wifis: Vec<WifiInfo>,
     pub signal_tick: [f64; 2],
     show_graph: bool,
+    scan_in_progress: bool,
+    scan_started_at: Option<Instant>,
 }
 
 impl Default for WifiScan {
@@ -88,10 +89,82 @@ impl WifiScan {
             wifis: Vec::new(),
             action_tx: None,
             signal_tick: [0.0, 40.0],
+            scan_in_progress: false,
+            scan_started_at: None,
         }
     }
 
-    fn make_table(&mut self) -> Table {
+    fn network_key(ssid: &str, mac: &str) -> String {
+        if mac.is_empty() {
+            ssid.to_string()
+        } else {
+            format!("{ssid}|{mac}")
+        }
+    }
+
+    fn stable_color(ssid: &str, mac: &str) -> Color {
+        let mut hasher = DefaultHasher::new();
+        ssid.hash(&mut hasher);
+        mac.hash(&mut hasher);
+        let idx = (hasher.finish() as usize) % COLORS_NAMES.len();
+        COLORS_NAMES[idx]
+    }
+
+    fn parse_channel(raw: &str) -> u8 {
+        raw.split(|c: char| !c.is_ascii_digit())
+            .find_map(|token| {
+                if token.is_empty() {
+                    None
+                } else {
+                    token.parse::<u8>().ok()
+                }
+            })
+            .unwrap_or(0)
+    }
+
+    fn parse_signal_level(raw: &str) -> f32 {
+        raw.split_whitespace()
+            .find_map(|token| token.parse::<f32>().ok())
+            .unwrap_or(-100.0)
+    }
+
+    fn build_scan_results(nets: Vec<Wifi>) -> Vec<WifiInfo> {
+        let mut grouped: HashMap<String, WifiInfo> = HashMap::new();
+        let now = Local::now();
+
+        for w in nets {
+            let ssid = if w.ssid.trim().is_empty() {
+                "<hidden>".to_string()
+            } else {
+                w.ssid
+            };
+            let mac = w.mac.trim().to_string();
+            let candidate = WifiInfo {
+                time: now,
+                ssid: ssid.clone(),
+                channel: Self::parse_channel(&w.channel),
+                signal: Self::parse_signal_level(&w.signal_level),
+                mac: mac.clone(),
+                color: Self::stable_color(&ssid, &mac),
+            };
+            let key = candidate.key();
+
+            match grouped.get_mut(&key) {
+                Some(existing) => {
+                    if candidate.signal > existing.signal {
+                        *existing = candidate;
+                    }
+                }
+                None => {
+                    grouped.insert(key, candidate);
+                }
+            }
+        }
+
+        grouped.into_values().collect()
+    }
+
+    fn make_table(&mut self) -> Table<'_> {
         let header = Row::new(vec!["time", "ssid", "ch", "mac", "signal"])
             .style(Style::default().fg(Color::Yellow));
         // .bottom_margin(1);
@@ -101,9 +174,8 @@ impl WifiScan {
             let percent = ((s_clamp - MIN_DBM) / (MAX_DBM - MIN_DBM)).clamp(0.0, 1.0);
 
             let p = (percent * 10.0) as usize;
-            let gauge: String = std::iter::repeat(char::from_u32(0x25a8).unwrap_or('#'))
-                .take(p)
-                .collect();
+            let gauge: String =
+                std::iter::repeat_n(char::from_u32(0x25a8).unwrap_or('#'), p).collect();
 
             let signal = format!("({}){}", w.signal, gauge);
             let color = (percent * ((COLORS_SIGNAL.len() - 1) as f32)) as usize;
@@ -128,7 +200,7 @@ impl WifiScan {
             ]));
         }
 
-        let table = Table::new(
+        Table::new(
             rows,
             [
                 Constraint::Length(9),
@@ -160,76 +232,69 @@ impl WifiScan {
                 .border_type(DEFAULT_BORDER_STYLE)
                 .padding(Padding::new(1, 0, 1, 0)),
         )
-        .column_spacing(1);
-        table
+        .column_spacing(1)
     }
 
     pub fn scan(&mut self) {
-        let tx = self.action_tx.clone().unwrap();
-        tokio::spawn(async move {
-            let networks = tokio_wifiscanner::scan().await;
-            match networks {
-                Ok(nets) => {
-                    let mut wifi_nets: Vec<WifiInfo> = Vec::new();
-                    let now = Local::now();
-                    for w in nets {
-                        if let Some(n) = wifi_nets.iter_mut().find(|item| item.ssid == w.ssid) {
-                            let signal: f32 = w.signal_level.parse().unwrap_or(-100.00);
-                            if n.signal < signal {
-                                n.signal = signal;
-                                n.mac = w.mac;
-                                let channel = w.channel.parse::<u8>().unwrap_or(0);
-                                n.channel = channel;
-                            }
-                        } else {
-                            wifi_nets.push(WifiInfo {
-                                time: now,
-                                ssid: w.ssid,
-                                channel: w.channel.parse::<u8>().unwrap_or(0),
-                                signal: w.signal_level.parse::<f32>().unwrap_or(-100.00),
-                                mac: w.mac,
-                                color: COLORS_NAMES[wifi_nets.len() % COLORS_NAMES.len()],
-                            });
-                        }
-                    }
+        if self.scan_in_progress {
+            return;
+        }
+        let Some(tx) = self.action_tx.clone() else {
+            return;
+        };
+        self.scan_in_progress = true;
+        self.scan_started_at = Some(Instant::now());
 
-                    let t_send = tx.send(Action::Scan(wifi_nets));
-                    match t_send {
-                        Ok(n) => (),
-                        Err(e) => (),
-                    }
+        tokio::spawn(async move {
+            let wifi_nets = match tokio_wifiscanner::scan().await {
+                Ok(nets) => Self::build_scan_results(nets),
+                Err(e) => {
+                    log::debug!("wifi scan failed: {e}");
+                    Vec::new()
                 }
-                Err(_e) => (),
             };
+            let _ = tx.send(Action::Scan(wifi_nets));
         });
     }
 
-    fn parse_networks_data(&mut self, nets: &Vec<WifiInfo>) {
-        // -- clear signal values
-        self.wifis.iter_mut().for_each(|item| {
-            item.signal = 0.0;
-        });
-        // -- add or update wifi info
-        for w in nets {
-            if let Some(n) = self.wifis.iter_mut().find(|item| item.ssid == w.ssid) {
-                n.copy_values(w.clone());
-            } else {
-                self.wifis.push(w.clone());
-            }
+    fn parse_networks_data(&mut self, nets: &[WifiInfo]) {
+        let mut prev_colors: HashMap<String, Color> = HashMap::new();
+        for w in &self.wifis {
+            prev_colors.insert(w.key(), w.color);
         }
-        // -- sort wifi networks by signal strength (known RSSI first, descending)
-        self.wifis.sort_by(|a, b| {
-            match (a.signal < 0.0, b.signal < 0.0) {
-                (true, false) => std::cmp::Ordering::Less,
-                (false, true) => std::cmp::Ordering::Greater,
-                _ => b.signal.partial_cmp(&a.signal).unwrap(),
+
+        let mut merged = Vec::with_capacity(nets.len());
+        for w in nets {
+            let mut net = w.clone();
+            if let Some(prev_color) = prev_colors.get(&net.key()) {
+                net.color = *prev_color;
             }
+            merged.push(net);
+        }
+
+        // Sort known RSSI values first, strongest to weakest.
+        merged.sort_by(|a, b| match (a.signal < 0.0, b.signal < 0.0) {
+            (true, false) => Ordering::Less,
+            (false, true) => Ordering::Greater,
+            _ => b.signal.partial_cmp(&a.signal).unwrap_or(Ordering::Equal),
         });
+
+        self.wifis = merged;
     }
 
     fn app_tick(&mut self) -> Result<()> {
         let now = Instant::now();
         let elapsed = (now - self.scan_start_time).as_secs_f64();
+
+        if self.scan_in_progress {
+            if let Some(started_at) = self.scan_started_at
+                && (now - started_at).as_secs_f64() > 15.0
+            {
+                self.scan_in_progress = false;
+                self.scan_started_at = None;
+            }
+            return Ok(());
+        }
 
         if elapsed > 1.5 {
             self.scan_start_time = now;
@@ -262,6 +327,8 @@ impl Component for WifiScan {
         };
         // -- custom actions
         if let Action::Scan(ref nets) = action {
+            self.scan_in_progress = false;
+            self.scan_started_at = None;
             self.parse_networks_data(nets);
         }
 

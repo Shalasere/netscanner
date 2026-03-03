@@ -1,7 +1,6 @@
 use color_eyre::eyre::Result;
-use pnet::datalink::{self, NetworkInterface};
+use pnet::datalink;
 use ratatui::{prelude::*, widgets::*};
-use std::collections::HashMap;
 use std::process::{Command, Output};
 use std::time::Instant;
 use tokio::sync::mpsc::UnboundedSender;
@@ -10,14 +9,13 @@ use super::Component;
 use crate::{
     action::Action,
     layout::{get_horizontal_layout, get_vertical_layout},
-    mode::Mode,
     tui::Frame,
 };
 
 #[derive(Debug, PartialEq)]
 struct WifiConn {
     interface: String,
-    ifindex: u8,
+    ifindex: u32,
     mac: String,
     ssid: String,
     channel: String,
@@ -60,11 +58,11 @@ impl WifiInterface {
         Ok(())
     }
 
-    fn iw_command(&mut self, intf_name: String) -> Result<Output, CommandError> {
+    fn iw_command(&self, intf_name: &str, query: &str) -> Result<Output, CommandError> {
         let iw_output = Command::new("iw")
             .arg("dev")
             .arg(intf_name)
-            .arg("info")
+            .arg(query)
             .output()
             .map_err(|e| CommandError {
                 desc: format!("command failed: {}", e),
@@ -78,92 +76,115 @@ impl WifiInterface {
         }
     }
 
-    fn parse_iw_command(&mut self, output: String) -> WifiConn {
-        let lines = output.lines();
-        let mut hash = HashMap::new();
-        for l in lines {
-            let split = l.trim().split(" ").collect::<Vec<&str>>();
-            if split.len() > 1 {
-                hash.insert(split[0], split[1].trim());
+    fn parse_iw_info_output(&self, interface_name: &str, output: &str) -> WifiConn {
+        let mut conn = WifiConn {
+            interface: interface_name.to_string(),
+            ifindex: 0,
+            mac: String::new(),
+            ssid: String::new(),
+            channel: String::new(),
+            txpower: String::new(),
+        };
+
+        for line in output.lines().map(str::trim) {
+            if let Some(v) = line.strip_prefix("ifindex ") {
+                conn.ifindex = v.trim().parse::<u32>().unwrap_or(0);
+            } else if let Some(v) = line.strip_prefix("addr ") {
+                conn.mac = v.trim().to_string();
+            } else if let Some(v) = line.strip_prefix("channel ") {
+                conn.channel = v.split_whitespace().next().unwrap_or("").to_string();
+            } else if let Some(v) = line.strip_prefix("txpower ") {
+                conn.txpower = v.trim().to_string();
             }
         }
-        WifiConn {
-            interface: hash
-                .get("Interface")
-                .unwrap_or(&"")
-                .parse::<String>()
-                .unwrap_or(String::from("")),
-            ssid: hash
-                .get("ssid")
-                .unwrap_or(&"")
-                .parse::<String>()
-                .unwrap_or(String::from("")),
-            ifindex: hash
-                .get("ifindex")
-                .unwrap_or(&"")
-                .parse::<u8>()
-                .unwrap_or(0),
-            mac: hash
-                .get("addr")
-                .unwrap_or(&"")
-                .parse::<String>()
-                .unwrap_or(String::from("")),
-            channel: hash
-                .get("channel")
-                .unwrap_or(&"")
-                .parse::<String>()
-                .unwrap_or(String::from("")),
-            txpower: hash
-                .get("txpower")
-                .unwrap_or(&"")
-                .parse::<String>()
-                .unwrap_or(String::from("")),
+
+        conn
+    }
+
+    fn parse_iw_link_ssid(&self, output: &str) -> Option<String> {
+        for line in output.lines().map(str::trim) {
+            if let Some(v) = line.strip_prefix("SSID:") {
+                let ssid = v.trim();
+                if !ssid.is_empty() {
+                    return Some(ssid.to_string());
+                }
+            }
         }
+        None
     }
 
     fn get_connected_wifi_info(&mut self) {
-        let interfaces = datalink::interfaces();
-        for i in interfaces {
-            if let Ok(output) = self.iw_command(i.name) {
-                let o = String::from_utf8(output.stdout).unwrap_or(String::from(""));
-                self.wifi_info = Some(self.parse_iw_command(o));
+        self.wifi_info = None;
+        let mut fallback: Option<WifiConn> = None;
+
+        let mut interfaces = datalink::interfaces();
+        interfaces.sort_by(|a, b| a.name.cmp(&b.name));
+
+        for intf in interfaces {
+            let info = match self.iw_command(&intf.name, "info") {
+                Ok(output) => String::from_utf8(output.stdout).unwrap_or_default(),
+                Err(_) => continue,
+            };
+
+            let mut conn = self.parse_iw_info_output(&intf.name, &info);
+
+            if let Ok(link_output) = self.iw_command(&intf.name, "link") {
+                let link = String::from_utf8(link_output.stdout).unwrap_or_default();
+                if let Some(ssid) = self.parse_iw_link_ssid(&link) {
+                    conn.ssid = ssid;
+                }
+            }
+
+            if !conn.ssid.is_empty() {
+                self.wifi_info = Some(conn);
+                return;
+            }
+
+            if fallback.is_none() {
+                fallback = Some(conn);
             }
         }
+
+        self.wifi_info = fallback;
     }
 
-    fn make_list(&mut self) -> List {
+    fn make_list(&mut self) -> List<'_> {
         if let Some(wifi_info) = &self.wifi_info {
             let interface = &wifi_info.interface;
-            let interface_label = "Interface:";
             let ssid = &wifi_info.ssid;
-            let ssid_label = "SSID:";
-            let ifindex = &wifi_info.ifindex;
-            let ifindex_label = "Intf index:";
             let channel = &wifi_info.channel;
-            let channel_label = "Channel:";
             let txpower = &wifi_info.txpower;
-            let txpower_label = "TxPower:";
-            let mac = &wifi_info.mac;
-            let mac_label = "Mac addr:";
+            let ssid_text = if ssid.is_empty() {
+                "<not connected>"
+            } else {
+                ssid
+            };
 
-            let mut items: Vec<ListItem> = Vec::new();
-
-            items.push(ListItem::new(vec![
+            let items: Vec<ListItem> = vec![ListItem::new(vec![
                 Line::from(vec![
                     Span::styled(
-                        format!("{ssid_label:<12}"),
+                        format!("{:<10}", "Interface:"),
                         Style::default().fg(Color::White),
                     ),
-                    Span::styled(format!("{ssid:<12}"), Style::default().fg(Color::Green)),
+                    Span::styled(interface.clone(), Style::default().fg(Color::Green)),
+                    Span::raw("  "),
+                    Span::styled(format!("{:<6}", "SSID:"), Style::default().fg(Color::White)),
+                    Span::styled(ssid_text, Style::default().fg(Color::Green)),
                 ]),
                 Line::from(vec![
                     Span::styled(
-                        format!("{channel_label:<12}"),
+                        format!("{:<10}", "Channel:"),
                         Style::default().fg(Color::White),
                     ),
                     Span::styled(format!("{channel:<12}"), Style::default().fg(Color::Green)),
+                    Span::raw("  "),
+                    Span::styled(
+                        format!("{:<8}", "TxPower:"),
+                        Style::default().fg(Color::White),
+                    ),
+                    Span::styled(txpower.clone(), Style::default().fg(Color::Green)),
                 ]),
-            ]));
+            ])];
 
             List::new(items).block(
                 Block::default()

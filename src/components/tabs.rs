@@ -5,7 +5,7 @@ use ratatui::style::Stylize;
 use ratatui::{prelude::*, widgets::*};
 use ratatui::{
     text::{Line, Span},
-    widgets::{block::Title, Paragraph},
+    widgets::{Paragraph, block::Title},
 };
 use serde::{Deserialize, Serialize};
 use strum::{EnumCount, IntoEnumIterator};
@@ -36,7 +36,7 @@ impl Tabs {
         }
     }
 
-    fn make_tabs(&self) -> Paragraph {
+    fn make_tabs(&self) -> Paragraph<'_> {
         let enum_titles: Vec<Span> =
             TabsEnum::iter()
                 .enumerate()

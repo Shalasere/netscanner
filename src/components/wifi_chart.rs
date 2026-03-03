@@ -63,7 +63,7 @@ impl WifiChart {
             {
                 let n = &mut self.wifi_datasets[p];
                 let signal: f64 = w.signal as f64;
-                n.data.push((self.signal_tick[1], signal * -1.0));
+                n.data.push((self.signal_tick[1], -signal));
             } else {
                 self.wifi_datasets.push(WifiDataset {
                     ssid: w.ssid.clone(),
@@ -76,7 +76,7 @@ impl WifiChart {
         self.signal_tick[1] += 1.0;
     }
 
-    pub fn make_chart(&self) -> Chart {
+    pub fn make_chart(&self) -> Chart<'_> {
         let mut datasets = Vec::new();
         for d in &self.wifi_datasets {
             let d_data = &d.data.get_vec();
@@ -99,7 +99,7 @@ impl WifiChart {
         .map(Span::from)
         .collect();
 
-        let chart = Chart::new(datasets)
+        Chart::new(datasets)
             .block(
                 Block::new()
                     .title(
@@ -142,8 +142,7 @@ impl WifiChart {
                     .style(Style::default().fg(Color::Yellow)),
             )
             .legend_position(Some(LegendPosition::TopLeft))
-            .hidden_legend_constraints((Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)));
-        chart
+            .hidden_legend_constraints((Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)))
     }
 }
 
