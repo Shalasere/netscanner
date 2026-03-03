@@ -13,6 +13,7 @@
       "<s>": "Scan",
       "<a>": "ScanAll",
       "<p>": "PortInput",
+      "<n>": "NetworkInput",
       "<e>": "Export",
       "<up>": "Up",
       "<down>": "Down",

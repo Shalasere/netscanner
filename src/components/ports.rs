@@ -3,18 +3,23 @@ use color_eyre::eyre::Result;
 use color_eyre::owo_colors::OwoColorize;
 use crossterm::event::{Event, KeyCode, KeyEvent};
 use dns_lookup::{lookup_addr, lookup_host};
-use futures::stream;
 use futures::StreamExt;
+use futures::future::join_all;
+use futures::stream;
 use ratatui::style::Stylize;
 use ratatui::{prelude::*, widgets::*};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::{
     net::TcpStream,
-    sync::mpsc::{self, UnboundedSender},
+    sync::{
+        Semaphore,
+        mpsc::{self, UnboundedSender},
+    },
 };
-use tui_input::backend::crossterm::EventHandler; // Brings `handle_event` into scope.
-use tui_input::Input; // For port input.
+use tui_input::Input;
+use tui_input::backend::crossterm::EventHandler; // Brings `handle_event` into scope. // For port input.
 
 use super::Component;
 // Adjust these to match your own definitions:
@@ -25,12 +30,21 @@ use crate::{
     config::DEFAULT_BORDER_STYLE,
     layout::get_vertical_layout,
     tui::Frame,
+    utils::get_ips4_from_cidr,
 };
 
 pub const DEFAULT_COMMON_PORTS: &[u16] = &[22, 80, 443];
+pub const DEFAULT_SCAN_NETWORK: &str = "192.168.1.0/24";
 
-static POOL_SIZE: usize = 64;
+static PORT_POOL_SIZE: usize = 64;
+static IP_POOL_SIZE: usize = 32;
 const SPINNER_SYMBOLS: [&str; 6] = ["⠷", "⠯", "⠟", "⠻", "⠽", "⠾"];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputTarget {
+    Ports,
+    Network,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScannedIpPorts {
@@ -49,7 +63,10 @@ pub struct Ports {
     spinner_index: usize,
     port_input: Input,                 // For user-specified ports.
     specified_ports: Option<Vec<u16>>, // Parsed port numbers.
-    mode: Mode,                        // Normal or Input mode.
+    network_input: Input,
+    input_target: InputTarget,
+    input_error: Option<String>,
+    mode: Mode, // Normal or Input mode.
     port_desc: Option<port_desc::PortDescription>,
 }
 
@@ -71,6 +88,9 @@ impl Ports {
             spinner_index: 0,
             port_input: Input::default().with_value("22,80,443".to_string()),
             specified_ports: None,
+            network_input: Input::default().with_value(DEFAULT_SCAN_NETWORK.to_string()),
+            input_target: InputTarget::Ports,
+            input_error: None,
             mode: Mode::Normal,
             port_desc,
         }
@@ -140,13 +160,19 @@ impl Ports {
                                 "s",
                                 Style::default().add_modifier(Modifier::BOLD).fg(Color::Red),
                             ),
-                            Span::styled("can selected", Style::default().fg(Color::Yellow)),
+                            Span::styled("can network", Style::default().fg(Color::Yellow)),
                             Span::styled("|", Style::default().fg(Color::Yellow)),
                             Span::styled(
                                 "a",
                                 Style::default().add_modifier(Modifier::BOLD).fg(Color::Red),
                             ),
-                            Span::styled("ll", Style::default().fg(Color::Yellow)),
+                            Span::styled("ll listed", Style::default().fg(Color::Yellow)),
+                            Span::styled("|", Style::default().fg(Color::Yellow)),
+                            Span::styled(
+                                "p",
+                                Style::default().add_modifier(Modifier::BOLD).fg(Color::Red),
+                            ),
+                            Span::styled("orts input", Style::default().fg(Color::Yellow)),
                             Span::styled("|", Style::default().fg(Color::Yellow)),
                         ]))
                         .alignment(Alignment::Right),
@@ -216,7 +242,7 @@ impl Ports {
 
     fn previous_in_list(&mut self) {
         let index = match self.list_state.selected() {
-            Some(idx) if idx == 0 => {
+            Some(0) => {
                 if self.ip_ports.is_empty() {
                     0
                 } else {
@@ -238,11 +264,7 @@ impl Ports {
                 } else {
                     self.ip_ports.len() - 1
                 };
-                if idx >= max_index {
-                    0
-                } else {
-                    idx + 1
-                }
+                if idx >= max_index { 0 } else { idx + 1 }
             }
             None => 0,
         };
@@ -274,17 +296,20 @@ impl Ports {
         }
     }
 
-    fn make_port_input(&self, scroll: usize) -> Paragraph {
+    fn make_port_input(&self, scroll: usize) -> Paragraph<'_> {
         Paragraph::new(self.port_input.value())
             .style(Style::default().fg(Color::Green))
             .scroll((0, scroll as u16))
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_style(match self.mode {
-                        Mode::Input => Style::default().fg(Color::Green),
-                        Mode::Normal => Style::default().fg(Color::Rgb(100, 100, 100)),
-                    })
+                    .border_style(
+                        if self.mode == Mode::Input && self.input_target == InputTarget::Ports {
+                            Style::default().fg(Color::Green)
+                        } else {
+                            Style::default().fg(Color::Rgb(100, 100, 100))
+                        },
+                    )
                     .border_type(DEFAULT_BORDER_STYLE)
                     .title(
                         ratatui::widgets::block::Title::from(Line::from(vec![
@@ -293,7 +318,7 @@ impl Ports {
                                 "p",
                                 Style::default().add_modifier(Modifier::BOLD).fg(Color::Red),
                             ),
-                            Span::styled("orts", Style::default().fg(Color::Yellow)),
+                            Span::styled("orts (comma CSV)", Style::default().fg(Color::Yellow)),
                             Span::raw("/"),
                             Span::styled(
                                 "ESC",
@@ -311,7 +336,10 @@ impl Ports {
                                 "d",
                                 Style::default().add_modifier(Modifier::BOLD).fg(Color::Red),
                             ),
-                            Span::styled("efaults", Style::default().fg(Color::Yellow)),
+                            Span::styled(
+                                "efaults / TAB switch",
+                                Style::default().fg(Color::Yellow),
+                            ),
                             Span::raw("|"),
                         ]))
                         .alignment(Alignment::Left)
@@ -320,28 +348,87 @@ impl Ports {
             )
     }
 
-    fn handle_port_input(&mut self, key: KeyEvent) -> Option<Action> {
-        match key.code {
-            KeyCode::Enter => match Self::parse_ports(self.port_input.value()) {
-                Ok(ports) => {
-                    self.specified_ports = Some(ports);
-                    self.mode = Mode::Normal; // Exit port input mode.
-                    None
-                }
-                Err(err) => Some(Action::Error(err)),
-            },
-            _ => {
-                self.port_input.handle_event(&Event::Key(key));
-                None
-            }
+    fn make_network_input(&self, scroll: usize) -> Paragraph<'_> {
+        Paragraph::new(self.network_input.value())
+            .style(Style::default().fg(Color::Green))
+            .scroll((0, scroll as u16))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(
+                        if self.mode == Mode::Input && self.input_target == InputTarget::Network {
+                            Style::default().fg(Color::Green)
+                        } else {
+                            Style::default().fg(Color::Rgb(100, 100, 100))
+                        },
+                    )
+                    .border_type(DEFAULT_BORDER_STYLE)
+                    .title(
+                        ratatui::widgets::block::Title::from(Line::from(vec![
+                            Span::raw("|"),
+                            Span::styled(
+                                "n",
+                                Style::default().add_modifier(Modifier::BOLD).fg(Color::Red),
+                            ),
+                            Span::styled("etwork CIDR", Style::default().fg(Color::Yellow)),
+                            Span::raw("|"),
+                        ]))
+                        .alignment(Alignment::Right)
+                        .position(ratatui::widgets::block::Position::Bottom),
+                    )
+                    .title(
+                        ratatui::widgets::block::Title::from(Line::from(vec![
+                            Span::raw("|"),
+                            Span::styled(
+                                "s",
+                                Style::default().add_modifier(Modifier::BOLD).fg(Color::Red),
+                            ),
+                            Span::styled("can network", Style::default().fg(Color::Yellow)),
+                            Span::raw("|"),
+                        ]))
+                        .alignment(Alignment::Left)
+                        .position(ratatui::widgets::block::Position::Bottom),
+                    ),
+            )
+    }
+
+    fn parse_network(&self) -> Result<Ipv4Cidr, String> {
+        self.network_input
+            .value()
+            .trim()
+            .parse::<Ipv4Cidr>()
+            .map_err(|_| format!("Invalid network CIDR: {}", self.network_input.value()))
+    }
+
+    fn begin_input_mode(&mut self, target: InputTarget) {
+        self.input_target = target;
+        self.input_error = None;
+        self.mode = Mode::Input;
+        if let Some(tx) = &self.action_tx {
+            let _ = tx.send(Action::AppModeChange(Mode::Input));
         }
     }
 
-    fn scan_ports_for_index(&mut self, index: usize) {
-        if index >= self.ip_ports.len() {
+    fn finish_input_mode(&mut self) {
+        self.mode = Mode::Normal;
+        if let Some(tx) = &self.action_tx {
+            let _ = tx.send(Action::AppModeChange(Mode::Normal));
+        }
+    }
+
+    fn get_ports_to_scan(&self) -> Vec<u16> {
+        if let Some(ref ports) = self.specified_ports {
+            ports.clone()
+        } else {
+            DEFAULT_COMMON_PORTS.to_vec()
+        }
+    }
+
+    fn scan_targets(&mut self, selected_indices: Vec<usize>) {
+        if selected_indices.is_empty() {
             return;
         }
-        self.ip_ports[index].state = PortsScanState::Scanning;
+
         let tx = match self.action_tx.clone() {
             Some(tx) => tx,
             None => {
@@ -349,77 +436,136 @@ impl Ports {
                 return;
             }
         };
-        let ip_key = self.ip_ports[index].ip.clone();
-        let ip_addr: IpAddr = match self.ip_ports[index].ip.parse() {
-            Ok(addr) => addr,
-            Err(e) => {
-                eprintln!(
-                    "Failed to parse IP address {}: {}",
-                    self.ip_ports[index].ip, e
-                );
-                return;
+        let default_ports = self.get_ports_to_scan();
+
+        let mut targets: Vec<(String, IpAddr, Vec<u16>)> = Vec::new();
+        for index in selected_indices {
+            if index >= self.ip_ports.len() {
+                continue;
             }
-        };
-        let ports_vec: Vec<u16> = if let Some(ref ports) = self.specified_ports {
-            ports.clone()
-        } else {
-            DEFAULT_COMMON_PORTS.to_vec()
-        };
+            if self.ip_ports[index].state == PortsScanState::Scanning {
+                continue;
+            }
+            let ip_key = self.ip_ports[index].ip.clone();
+            let ip_addr: IpAddr = match ip_key.parse() {
+                Ok(addr) => addr,
+                Err(e) => {
+                    eprintln!("Failed to parse IP address {}: {}", ip_key, e);
+                    continue;
+                }
+            };
+            self.ip_ports[index].ports.clear();
+            self.ip_ports[index].state = PortsScanState::Scanning;
+            targets.push((ip_key, ip_addr, default_ports.clone()));
+        }
+        if targets.is_empty() {
+            return;
+        }
 
         tokio::spawn(async move {
-            let ports = stream::iter(ports_vec);
-            ports
-                .for_each_concurrent(POOL_SIZE, |port| {
-                    Self::scan(tx.clone(), ip_key.clone(), ip_addr, port, 2)
-                })
-                .await;
-            if let Err(e) = tx.send(Action::PortScanDone(ip_key.clone())) {
-                eprintln!("Failed to send PortScanDone for {}: {}", ip_key, e);
-            }
-        });
-    }
-
-    fn scan_selected(&mut self) {
-        if let Some(index) = self.list_state.selected() {
-            self.scan_ports_for_index(index);
-        }
-    }
-
-    fn scan_ports(&mut self) {
-        for i in 0..self.ip_ports.len() {
-            if self.ip_ports[i].state != PortsScanState::Scanning {
-                let tx = match self.action_tx.clone() {
-                    Some(tx) => tx,
-                    None => {
-                        eprintln!("Action TX not registered");
-                        return;
-                    }
-                };
-                let ip_key = self.ip_ports[i].ip.clone();
-                let ip_addr: IpAddr = match self.ip_ports[i].ip.parse() {
-                    Ok(addr) => addr,
-                    Err(e) => {
-                        eprintln!("Failed to parse IP address {}: {}", self.ip_ports[i].ip, e);
-                        continue;
-                    }
-                };
-                let ports_vec: Vec<u16> = if let Some(ref ports) = self.specified_ports {
-                    ports.clone()
-                } else {
-                    DEFAULT_COMMON_PORTS.to_vec()
-                };
-
+            let ip_semaphore = Arc::new(Semaphore::new(IP_POOL_SIZE));
+            let jobs = targets.into_iter().map(|(ip_key, ip_addr, ports_vec)| {
+                let tx = tx.clone();
+                let ip_semaphore = ip_semaphore.clone();
                 tokio::spawn(async move {
-                    let ports = stream::iter(ports_vec);
-                    ports
-                        .for_each_concurrent(POOL_SIZE, |port| {
+                    let _permit = ip_semaphore.acquire_owned().await;
+                    stream::iter(ports_vec)
+                        .for_each_concurrent(PORT_POOL_SIZE, |port| {
                             Self::scan(tx.clone(), ip_key.clone(), ip_addr, port, 2)
                         })
                         .await;
                     if let Err(e) = tx.send(Action::PortScanDone(ip_key.clone())) {
                         eprintln!("Failed to send PortScanDone for {}: {}", ip_key, e);
                     }
-                });
+                })
+            });
+            let _ = join_all(jobs).await;
+        });
+    }
+
+    fn scan_selected(&mut self) {
+        if let Some(index) = self.list_state.selected() {
+            self.scan_targets(vec![index]);
+        }
+    }
+
+    fn scan_ports(&mut self) {
+        let mut indices = Vec::new();
+        for i in 0..self.ip_ports.len() {
+            if self.ip_ports[i].state != PortsScanState::Scanning {
+                indices.push(i);
+            }
+        }
+        self.scan_targets(indices);
+    }
+
+    fn scan_network_ports(&mut self) {
+        let cidr = match self.parse_network() {
+            Ok(cidr) => cidr,
+            Err(err) => {
+                self.input_error = Some(err);
+                return;
+            }
+        };
+        self.input_error = None;
+
+        self.ip_ports.clear();
+        for ip in get_ips4_from_cidr(cidr) {
+            self.ip_ports.push(ScannedIpPorts {
+                ip: ip.to_string(),
+                state: PortsScanState::Waiting,
+                hostname: String::new(),
+                ports: Vec::new(),
+            });
+        }
+        self.set_scrollbar_height();
+        self.list_state.select(Some(0));
+        self.scan_ports();
+    }
+
+    fn handle_ports_key_input(&mut self, key: KeyEvent) -> Option<Action> {
+        match key.code {
+            KeyCode::Enter => match Self::parse_ports(self.port_input.value()) {
+                Ok(ports) => {
+                    self.specified_ports = Some(ports);
+                    self.input_error = None;
+                    self.finish_input_mode();
+                    Some(Action::ModeChange(Mode::Normal))
+                }
+                Err(err) => {
+                    self.input_error = Some(err);
+                    None
+                }
+            },
+            KeyCode::Tab => {
+                self.input_target = InputTarget::Network;
+                None
+            }
+            _ => {
+                self.port_input.handle_event(&Event::Key(key));
+                None
+            }
+        }
+    }
+
+    fn handle_network_key_input(&mut self, key: KeyEvent) -> Option<Action> {
+        match key.code {
+            KeyCode::Enter => {
+                if let Err(err) = self.parse_network() {
+                    self.input_error = Some(err);
+                    return None;
+                }
+                self.input_error = None;
+                self.finish_input_mode();
+                Some(Action::ModeChange(Mode::Normal))
+            }
+            KeyCode::Tab => {
+                self.input_target = InputTarget::Ports;
+                None
+            }
+            _ => {
+                self.network_input.handle_event(&Event::Key(key));
+                None
             }
         }
     }
@@ -437,27 +583,30 @@ impl Ports {
             Ok(Ok(_stream)) => {
                 // Clone ip_key so that the original remains available for logging.
                 if let Err(e) = tx.send(Action::PortScan(ip_key.clone(), port)) {
-                    eprintln!("Failed to send PortScan for {} port {}: {}", ip_key, port, e);
+                    eprintln!(
+                        "Failed to send PortScan for {} port {}: {}",
+                        ip_key, port, e
+                    );
                 }
-            },
+            }
             Ok(Err(e)) => {
                 eprintln!("Connection error on {}: {}", socket_addr, e);
-            },
+            }
             Err(e) => {
                 eprintln!("Timeout connecting to {}: {}", socket_addr, e);
             }
         }
     }
-    
+
     fn store_scanned_port(&mut self, ip_key: &str, port: u16) {
-        if let Some(entry) = self.ip_ports.iter_mut().find(|item| item.ip == ip_key) {
-            if !entry.ports.contains(&port) {
-                entry.ports.push(port);
-            }
+        if let Some(entry) = self.ip_ports.iter_mut().find(|item| item.ip == ip_key)
+            && !entry.ports.contains(&port)
+        {
+            entry.ports.push(port);
         }
     }
 
-    fn make_list(&self, rect: Rect) -> List {
+    fn make_list(&self, rect: Rect) -> List<'static> {
         let mut items = Vec::new();
         for ip in &self.ip_ports {
             let mut lines = Vec::new();
@@ -512,13 +661,19 @@ impl Ports {
                                 "s",
                                 Style::default().add_modifier(Modifier::BOLD).fg(Color::Red),
                             ),
-                            Span::styled("can selected", Style::default().fg(Color::Yellow)),
+                            Span::styled("can network", Style::default().fg(Color::Yellow)),
                             Span::styled("|", Style::default().fg(Color::Yellow)),
                             Span::styled(
                                 "a",
                                 Style::default().add_modifier(Modifier::BOLD).fg(Color::Red),
                             ),
-                            Span::styled("ll", Style::default().fg(Color::Yellow)),
+                            Span::styled("ll listed", Style::default().fg(Color::Yellow)),
+                            Span::styled("|", Style::default().fg(Color::Yellow)),
+                            Span::styled(
+                                "p",
+                                Style::default().add_modifier(Modifier::BOLD).fg(Color::Red),
+                            ),
+                            Span::styled("orts input", Style::default().fg(Color::Yellow)),
                             Span::styled("|", Style::default().fg(Color::Yellow)),
                         ]))
                         .alignment(Alignment::Right),
@@ -579,6 +734,23 @@ impl Component for Ports {
         Ok(())
     }
 
+    fn handle_key_events(&mut self, key: KeyEvent) -> Result<Option<Action>> {
+        if self.active_tab != TabsEnum::Ports || self.mode != Mode::Input {
+            return Ok(None);
+        }
+
+        if key.code == KeyCode::Esc {
+            self.finish_input_mode();
+            return Ok(Some(Action::ModeChange(Mode::Normal)));
+        }
+
+        let action = match self.input_target {
+            InputTarget::Ports => self.handle_ports_key_input(key),
+            InputTarget::Network => self.handle_network_key_input(key),
+        };
+        Ok(action)
+    }
+
     fn update(&mut self, action: Action) -> Result<Option<Action>> {
         match &action {
             Action::Tick => {
@@ -594,9 +766,14 @@ impl Component for Ports {
             match &action {
                 Action::Down => self.next_in_list(),
                 Action::Up => self.previous_in_list(),
-                Action::ScanCidr | Action::ScanSelected => self.scan_selected(),
+                Action::ScanSelected => self.scan_selected(),
+                Action::ScanCidr => self.scan_network_ports(),
                 Action::ScanAll => self.scan_ports(),
-                Action::PortInput => self.mode = Mode::Input,
+                Action::PortInput => self.begin_input_mode(InputTarget::Ports),
+                Action::NetworkInput => self.begin_input_mode(InputTarget::Network),
+                Action::ModeChange(mode) if *mode == Mode::Normal && self.mode == Mode::Input => {
+                    self.finish_input_mode();
+                }
                 _ => {}
             }
         }
@@ -624,10 +801,7 @@ impl Component for Ports {
             list_rect.y += 1;
             list_rect.height = list_rect.height.saturating_sub(1);
 
-            let ip_ports = self.ip_ports.clone();
-            let spinner_index = self.spinner_index;
-            let port_desc = self.port_desc.as_ref();
-            let list = Self::make_list_from_data(ip_ports, spinner_index, port_desc, list_rect);
+            let list = self.make_list(list_rect);
             f.render_stateful_widget(list, list_rect, &mut self.list_state);
 
             let scrollbar = Self::make_scrollbar();
@@ -643,21 +817,40 @@ impl Component for Ports {
                 &mut self.scrollbar_state,
             );
 
+            let input_size: u16 = 34;
+            let right_x = list_rect.x + list_rect.width.saturating_sub(input_size + 1);
+            let ports_rect = Rect::new(right_x, list_rect.y + 1, input_size, 3);
+            let network_rect = Rect::new(right_x, list_rect.y + 5, input_size, 3);
+
+            let p_scroll = self.port_input.visual_scroll((input_size - 3) as usize);
+            let n_scroll = self.network_input.visual_scroll((input_size - 3) as usize);
+            f.render_widget(self.make_port_input(p_scroll), ports_rect);
+            f.render_widget(self.make_network_input(n_scroll), network_rect);
+
+            if let Some(err) = &self.input_error {
+                let err_rect = Rect::new(right_x, list_rect.y + 9, input_size, 3);
+                let err_block = Paragraph::new(err.as_str())
+                    .style(Style::default().fg(Color::Red))
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_style(Style::default().fg(Color::Red))
+                            .border_type(DEFAULT_BORDER_STYLE),
+                    );
+                f.render_widget(err_block, err_rect);
+            }
+
             if self.mode == Mode::Input {
-                let input_size: u16 = 30;
-                let input_rect = Rect::new(
-                    list_rect.x + list_rect.width - input_size - 1,
-                    list_rect.y + 1,
-                    input_size,
-                    3,
-                );
-                let scroll = self.port_input.visual_scroll((input_size - 3) as usize);
-                let port_input_paragraph = self.make_port_input(scroll);
-                f.render_widget(port_input_paragraph, input_rect);
-                f.set_cursor_position((
-                    input_rect.x + (self.port_input.visual_cursor() as u16) + 1,
-                    input_rect.y + 1,
-                ));
+                match self.input_target {
+                    InputTarget::Ports => f.set_cursor_position((
+                        ports_rect.x + (self.port_input.visual_cursor() as u16) + 1,
+                        ports_rect.y + 1,
+                    )),
+                    InputTarget::Network => f.set_cursor_position((
+                        network_rect.x + (self.network_input.visual_cursor() as u16) + 1,
+                        network_rect.y + 1,
+                    )),
+                }
             }
         }
         Ok(())

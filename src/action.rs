@@ -2,8 +2,8 @@ use chrono::{DateTime, Local};
 use pnet::datalink::NetworkInterface;
 use ratatui::text::Line;
 use serde::{
-    de::{self, Deserializer, Visitor},
     Deserialize, Serialize,
+    de::{self, Deserializer, Visitor},
 };
 use std::{fmt, net::Ipv4Addr};
 
@@ -39,6 +39,7 @@ pub enum Action {
     ScanSelected,
     ScanAll,
     PortInput,
+    NetworkInput,
     ActiveInterface(NetworkInterface),
     ArpRecieve(ArpPacketData),
     Scan(Vec<WifiInfo>),
@@ -87,6 +88,7 @@ impl<'de> Deserialize<'de> for Action {
                     "ScanSelected" => Ok(Action::ScanSelected),
                     "ScanAll" => Ok(Action::ScanAll),
                     "PortInput" => Ok(Action::PortInput),
+                    "NetworkInput" => Ok(Action::NetworkInput),
                     "Clear" => Ok(Action::Clear),
                     "Up" => Ok(Action::Up),
                     "Down" => Ok(Action::Down),
